@@ -1,0 +1,16 @@
+node_modules
+.pnpm-store
+dist
+*.log
+.env
+.env.local
+.vscode
+.idea
+.git
+.gitignore
+Dockerfile
+.dockerignore
+docker-compose*.yml
+test
+coverage
+README.md

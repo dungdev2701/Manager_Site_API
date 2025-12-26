@@ -1,0 +1,374 @@
+// This is your Prisma schema file
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== USER MANAGEMENT ====================
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      Role     @default(CHECKER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  websitesCreated  Website[]         @relation("WebsiteCreator")
+  websitesChecked  Website[]         @relation("WebsiteChecker")
+  registrationLogs RegistrationLog[]
+  websiteStats     WebsiteStats[]
+
+  @@map("users")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  CHECKER
+  VIEWER
+}
+
+// ==================== WEBSITE/DOMAIN MANAGEMENT ====================
+model Website {
+  id          String         @id @default(uuid())
+  domain      String         @unique
+  status      WebsiteStatus  @default(UNTESTED)
+  notes       String?        @db.Text // Notes from CHECKER (combined note and error details)
+
+  // Metrics stored as JSONB - flexible for adding new metrics
+  metrics     Json?          @db.JsonB
+
+  // Tracking who created and last checked
+  createdBy   String?        // User who created this website
+  checkerId   String?        // Last person who checked/updated
+
+  // Additional info
+  priority    Int            @default(0) // Higher number = higher priority
+  category    String?        // Group websites by category
+  tags        String[]       @default([]) // Tags for filtering
+
+  // Timestamps
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  deletedAt    DateTime?     // Soft delete - null means active, date means deleted
+  lastTestedAt DateTime?     // Last time tested/checked
+  lastUsedAt   DateTime?     // Last time used by tool
+  lastCheckedAt DateTime?    // Last time someone checked/noted
+
+  // Relations
+  creator          User?                @relation("WebsiteCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  checker          User?                @relation("WebsiteChecker", fields: [checkerId], references: [id], onDelete: SetNull)
+  logs             RegistrationLog[]
+  stats            WebsiteStats[]
+  allocationItems  AllocationItem[]
+
+  @@index([status])
+  @@index([domain])
+  @@index([createdBy])
+  @@index([checkerId])
+  @@index([createdAt])
+  @@index([deletedAt])
+  @@map("websites")
+}
+
+enum WebsiteStatus {
+  RUNNING       // Đang chạy
+  ABANDONED     // Bỏ
+  TESTED        // Đã test
+  UNTESTED      // Chưa test
+  PENDING       // Đang chờ test
+  MAINTENANCE   // Đang bảo trì
+  ERROR         // Lỗi
+}
+
+enum CheckType {
+  MANUAL
+  AUTO
+  SCHEDULED
+}
+
+// ==================== REGISTRATION LOGS ====================
+model RegistrationLog {
+  id          String    @id @default(uuid())
+  websiteId   String
+  userId      String?   // Who triggered this (if manual)
+  
+  // Registration attempt details
+  isSuccess   Boolean
+  errorCode   String?
+  errorMessage String?  @db.Text
+  stackTrace  String?   @db.Text
+  
+  // Performance metrics
+  startTime   DateTime
+  endTime     DateTime?
+  duration    Int?      // Duration in milliseconds
+  
+  // Request/Response data
+  requestData Json?     @db.JsonB
+  responseData Json?    @db.JsonB
+  
+  // Tool information
+  toolVersion String?
+  toolName    String?
+  ipAddress   String?
+  userAgent   String?
+  
+  // Metadata
+  metadata    Json?     @db.JsonB
+  
+  createdAt   DateTime  @default(now())
+  
+  // Relations
+  website     Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  user        User?     @relation(fields: [userId], references: [id])
+  
+  @@index([websiteId])
+  @@index([isSuccess])
+  @@index([createdAt])
+  @@index([startTime])
+  @@map("registration_logs")
+}
+
+// ==================== STATISTICS ====================
+model WebsiteStats {
+  id          String    @id @default(uuid())
+  websiteId   String
+  userId      String?   // Stats per user (optional, null = system-level stats)
+
+  // Time period for stats
+  periodType  PeriodType
+  periodStart DateTime
+  periodEnd   DateTime
+
+  // Success metrics
+  totalAttempts    Int      @default(0)
+  successCount     Int      @default(0)
+  failureCount     Int      @default(0)
+  successRate      Float    @default(0)
+
+  // Performance metrics
+  avgDuration      Float?   // Average duration in milliseconds
+  minDuration      Float?
+  maxDuration      Float?
+
+  // Error tracking
+  errorTypes       Json?    @db.JsonB // {"error_type": count}
+
+  // Additional metrics
+  metrics          Json?    @db.JsonB
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // Relations
+  website     Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  user        User?     @relation(fields: [userId], references: [id])
+
+  // Note: Using separate index instead of unique constraint to support null userId
+  @@index([websiteId, periodType, periodStart])
+  @@index([websiteId])
+  @@index([periodStart, periodEnd])
+  @@map("website_stats")
+}
+
+enum PeriodType {
+  HOURLY
+  DAILY
+  WEEKLY
+  MONTHLY
+  CUSTOM
+}
+
+// ==================== SYSTEM SETTINGS ====================
+model SystemSetting {
+  id        String   @id @default(uuid())
+  key       String   @unique
+  category  String?
+  value     Json     @db.JsonB
+  description String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@map("system_settings")
+}
+
+// ==================== AUDIT LOG ====================
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String?
+  action      String   // CREATE, UPDATE, DELETE, etc.
+  entity      String   // Website, User, etc.
+  entityId    String?
+  oldValues   Json?    @db.JsonB
+  newValues   Json?    @db.JsonB
+  ipAddress   String?
+  userAgent   String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ==================== WEBSITE ALLOCATION ====================
+// Batch phân bổ website cho mỗi entity_request từ MySQL
+model AllocationBatch {
+  id                  String              @id @default(uuid())
+  externalRequestId   String              // ID của entity_request bên MySQL
+  batchNumber         Int                 // Số thứ tự batch (1, 2, 3...)
+
+  // Allocation info
+  targetCount         Int                 // Số website cần phân bổ trong batch này
+  allocatedCount      Int                 @default(0)
+  highTrafficCount    Int                 @default(0) // Số website traffic cao
+  lowTrafficCount     Int                 @default(0) // Số website traffic thấp
+
+  // Status
+  status              AllocationBatchStatus @default(PENDING)
+
+  // Timing
+  startedAt           DateTime?
+  completedAt         DateTime?
+
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  // Relations
+  items               AllocationItem[]
+
+  @@unique([externalRequestId, batchNumber])
+  @@index([externalRequestId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("allocation_batches")
+}
+
+enum AllocationBatchStatus {
+  PENDING     // Chờ phân bổ
+  PROCESSING  // Đang phân bổ
+  COMPLETED   // Hoàn thành phân bổ
+  FAILED      // Thất bại
+}
+
+// Chi tiết từng website được phân bổ
+model AllocationItem {
+  id              String              @id @default(uuid())
+  batchId         String
+  websiteId       String
+  domain          String              // Lưu domain để dễ insert vào MySQL entity_link
+
+  // Allocation tracking
+  trafficType     TrafficType         // HIGH hoặc LOW
+  priorityScore   Float               @default(0) // Score dùng để sort (based on success rate)
+
+  // Result tracking (sync từ entity_link)
+  status          AllocationItemStatus @default(PENDING)
+  resultSyncedAt  DateTime?           // Khi sync kết quả từ MySQL
+
+  // Error info (if failed)
+  errorCode       String?
+  errorMessage    String?
+
+  allocatedAt     DateTime            @default(now())
+  completedAt     DateTime?
+
+  // Relations
+  batch           AllocationBatch     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  website         Website             @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([batchId])
+  @@index([websiteId])
+  @@index([status])
+  @@index([allocatedAt])
+  @@map("allocation_items")
+}
+
+enum TrafficType {
+  HIGH    // >= 50k traffic
+  LOW     // < 50k traffic
+}
+
+enum AllocationItemStatus {
+  PENDING     // Đã phân bổ, chờ chạy
+  RUNNING     // Đang chạy
+  SUCCESS     // Thành công
+  FAILED      // Thất bại
+  SKIPPED     // Bỏ qua
+  CANCELLED   // Bị hủy (chưa chạy, không tính vào success rate)
+}
+
+// ==================== DAILY ALLOCATION TRACKING ====================
+// Track số lần website được phân bổ trong ngày
+model DailyAllocation {
+  id              String    @id @default(uuid())
+  websiteId       String
+  date            DateTime  @db.Date // Ngày (không có giờ)
+
+  allocationCount Int       @default(0) // Số lần được phân bổ trong ngày
+  successCount    Int       @default(0)
+  failureCount    Int       @default(0)
+
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([websiteId, date])
+  @@index([websiteId])
+  @@index([date])
+  @@map("daily_allocations")
+}
+
+// ==================== SYSTEM ALERTS ====================
+// Alert khi có vấn đề (timeout, tool offline, etc.)
+model SystemAlert {
+  id            String        @id @default(uuid())
+  type          AlertType
+  severity      AlertSeverity @default(WARNING)
+
+  title         String
+  message       String        @db.Text
+
+  // Related entities
+  entityType    String?       // Request, Tool, Website, etc.
+  entityId      String?
+
+  // Status
+  isResolved    Boolean       @default(false)
+  resolvedAt    DateTime?
+  resolvedBy    String?
+
+  metadata      Json?         @db.JsonB
+
+  createdAt     DateTime      @default(now())
+
+  @@index([type])
+  @@index([severity])
+  @@index([isResolved])
+  @@index([createdAt])
+  @@map("system_alerts")
+}
+
+enum AlertType {
+  REQUEST_TIMEOUT     // Request quá deadline
+  TOOL_OFFLINE        // Tool offline
+  ALLOCATION_FAILED   // Phân bổ thất bại
+  LOW_SUCCESS_RATE    // Tỷ lệ thành công thấp
+  NO_AVAILABLE_TOOLS  // Không còn tool khả dụng
+  SYSTEM_ERROR        // Lỗi hệ thống
+}
+
+enum AlertSeverity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}

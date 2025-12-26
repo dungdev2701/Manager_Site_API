@@ -1,0 +1,66 @@
+{
+    "name": "fastify-backend-api",
+    "version": "1.0.0",
+    "description": "Fastify backend API with Prisma and PostgreSQL",
+    "main": "app.ts",
+    "directories": {
+        "test": "test"
+    },
+    "scripts": {
+        "test": "pnpm run build:ts && tsc -p test/tsconfig.json && c8 node --test -r ts-node/register \"test/**/*.ts\"",
+        "start": "pnpm run build:ts && fastify start -l info dist/app.js",
+        "build:ts": "tsc",
+        "watch:ts": "tsc -w",
+        "clean": "taskkill /F /IM node.exe || echo No processes to kill",
+        "dev": "pnpm run build:ts && concurrently -k -p \"[{name}]\" -n \"TypeScript,App\" -c \"yellow.bold,cyan.bold\" \"pnpm:watch:ts\" \"pnpm:dev:start\"",
+        "dev:start": "fastify start --ignore-watch=.ts$ -w -l info -P --watch-options={\"debounce\":500} dist/app.js",
+        "prisma:generate": "prisma generate",
+        "prisma:migrate": "prisma migrate dev",
+        "prisma:studio": "prisma studio",
+        "prisma:push": "prisma db push",
+        "prisma:seed": "ts-node prisma/seed.ts"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@fastify/autoload": "^6.0.0",
+        "@fastify/cookie": "^11.0.2",
+        "@fastify/cors": "^10.1.0",
+        "@fastify/formbody": "^8.0.2",
+        "@fastify/jwt": "^9.0.4",
+        "@fastify/rate-limit": "^10.2.2",
+        "@fastify/sensible": "^6.0.0",
+        "@prisma/client": "^6.4.1",
+        "bcryptjs": "3.0.3",
+        "dotenv": "^16.4.7",
+        "fastify": "^5.0.0",
+        "fastify-cli": "^7.3.0",
+        "fastify-plugin": "^5.0.0",
+        "lodash": "^4.17.21",
+        "luxon": "^3.5.0",
+        "mysql2": "3.16.0",
+        "pino-pretty": "^13.0.0",
+        "prisma": "6.1.0",
+        "uuid": "^11.1.0",
+        "validator": "^13.12.0",
+        "zod": "^3.24.2"
+    },
+    "devDependencies": {
+        "@types/bcrypt": "^5.0.2",
+        "@types/bcryptjs": "3.0.0",
+        "@types/lodash": "^4.17.16",
+        "@types/luxon": "^3.4.2",
+        "@types/node": "^22.1.0",
+        "@types/validator": "^13.12.2",
+        "c8": "^10.1.2",
+        "concurrently": "^9.0.0",
+        "fastify-tsconfig": "^2.0.0",
+        "ts-node": "^10.4.0",
+        "tsconfig-paths": "^4.2.0",
+        "typescript": "~5.6.3"
+    },
+    "prisma": {
+        "seed": "ts-node prisma/seed.ts"
+    }
+}
