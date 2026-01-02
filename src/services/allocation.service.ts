@@ -376,11 +376,16 @@ export class AllocationService {
   /**
    * Sync results from MySQL when EntityRequest is completed
    * Flow:
-   * 1. Check EntityRequest status in MySQL
-   * 2. If completed, sync all entity_link results
-   * 3. Update AllocationItem statuses
+   * 1. Check EntityRequest status in MySQL (batch query)
+   * 2. If completed, sync all entity_link results (batch query)
+   * 3. Update AllocationItem statuses (batch update)
    * 4. Update DailyAllocation counts
    * 5. Update WebsiteStats with new success rates
+   *
+   * OPTIMIZED: Sử dụng batch queries để giảm số lượng kết nối DB
+   * - 1 query lấy tất cả batches từ PostgreSQL
+   * - 1 query lấy tất cả requests từ MySQL (thay vì N queries)
+   * - 1 query lấy tất cả entity_links từ MySQL (thay vì N queries)
    */
   async syncCompletedRequests(): Promise<{
     syncedRequests: number;
@@ -389,126 +394,170 @@ export class AllocationService {
     let syncedRequests = 0;
     const websitesToUpdate = new Set<string>();
 
-    // Get batches that have unsynced items (resultSyncedAt is null)
+    // Get all COMPLETED batches to check for status changes
+    // Không chỉ lấy batches có items chưa sync, mà lấy tất cả để detect status changes
     const batches = await this.prisma.allocationBatch.findMany({
       where: {
         status: AllocationBatchStatus.COMPLETED,
-        items: {
-          some: {
-            resultSyncedAt: null,
-          },
-        },
       },
       include: {
-        items: {
-          where: {
-            resultSyncedAt: null,
-          },
-        },
+        items: true,
       },
     });
 
+    if (batches.length === 0) {
+      return { syncedRequests: 0, updatedWebsites: 0 };
+    }
+
+    // Collect all unique request IDs
+    const requestIds = [...new Set(batches.map((b) => b.externalRequestId))];
+
+    // BATCH QUERY 1: Lấy tất cả requests từ MySQL trong 1 query
+    const allRequests = await this.mysqlRepo.entityRequest.findByIds(requestIds);
+    const requestStatusMap = new Map(
+      allRequests.map((r) => [String(r.id), r.status])
+    );
+
+    // Lọc ra các request đã completed
+    const completedRequestIds = requestIds.filter(
+      (id) => requestStatusMap.get(id) === 'completed'
+    );
+
+    if (completedRequestIds.length === 0) {
+      return { syncedRequests: 0, updatedWebsites: 0 };
+    }
+
+    // BATCH QUERY 2: Lấy tất cả entity_links từ MySQL trong 1 query
+    const allLinksMap = await this.mysqlRepo.entityLink.findByRequestIds(completedRequestIds);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Prepare batch updates
+    const itemsToUpdate: Array<{
+      id: string;
+      status: AllocationItemStatus;
+      completedAt: Date | null;
+      resultSyncedAt: Date | null;
+    }> = [];
+
+    // Track daily allocation changes for batch upsert
+    const dailySuccessMap = new Map<string, number>();
+    const dailyFailureMap = new Map<string, number>();
+
+    // Process each batch
     for (const batch of batches) {
       const requestId = batch.externalRequestId;
 
-      // Check if request is completed in MySQL
-      const request = await this.mysqlRepo.entityRequest.findById(requestId);
-      if (!request || request.status !== 'completed') {
-        continue; // Skip if not completed yet
+      // Skip if request is not completed
+      if (requestStatusMap.get(requestId) !== 'completed') {
+        continue;
       }
 
-      // Get all links for this request
-      const allLinks = await this.mysqlRepo.entityLink.findByRequestId(requestId);
+      // Get links for this request from the batch query result
+      const links = allLinksMap.get(requestId) || [];
       const linkStatusMap = new Map(
-        allLinks.map((l) => [l.site, l.status])
+        links.map((l) => [l.site, l.status])
       );
 
-      // Get ALL items for this batch (including already synced ones for stats)
-      const allItems = await this.prisma.allocationItem.findMany({
-        where: { batchId: batch.id },
-      });
-
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      // Update each allocation item
-      for (const item of allItems) {
+      // Process each item
+      for (const item of batch.items) {
         const linkStatus = linkStatusMap.get(item.domain);
 
-        // Skip if already synced
-        if (item.resultSyncedAt) {
-          websitesToUpdate.add(item.websiteId);
-          continue;
-        }
+        // Note: MySQL có thể lưu status với dấu gạch dưới hoặc khoảng trắng
+        // Cần check cả 2 format để đảm bảo tương thích
+        const status = linkStatus as string;
 
         // Determine new status based on entity_link status
         let newStatus: AllocationItemStatus;
-        let shouldUpdateStats = false;
 
-        if (!linkStatus || linkStatus === 'new') {
-          // Still running or not found
+        if (!status || status === 'new') {
           newStatus = AllocationItemStatus.RUNNING;
-        } else if (linkStatus === 'finish') {
+        } else if (status === 'finish' || status === 'fail connecting' || status === 'fail_connecting') {
+          // fail connecting / fail_connecting = đã qua register + profile, chỉ lỗi ở bước connecting
+          // -> tính là SUCCESS
           newStatus = AllocationItemStatus.SUCCESS;
-          shouldUpdateStats = true;
-        } else if (linkStatus === 'cancel') {
-          // Cancel = chưa được chạy, không tính vào success/failure rate
+        } else if (status === 'cancel') {
           newStatus = AllocationItemStatus.CANCELLED;
         } else {
-          // failed và các status khác
           newStatus = AllocationItemStatus.FAILED;
-          shouldUpdateStats = true;
         }
 
-        // Update allocation item
-        const isCompleted = linkStatus !== 'new' && linkStatus !== undefined;
-        await this.prisma.allocationItem.update({
-          where: { id: item.id },
-          data: {
-            status: newStatus,
-            completedAt: isCompleted ? new Date() : null,
-            resultSyncedAt: isCompleted ? new Date() : null,
-          },
-        });
+        const isCompleted = status !== 'new' && status !== undefined;
 
-        // Update daily allocation counts - chỉ tính finish và failed, không tính cancel
-        if (shouldUpdateStats) {
-          if (linkStatus === 'finish') {
-            await this.prisma.dailyAllocation.upsert({
-              where: {
-                websiteId_date: { websiteId: item.websiteId, date: today },
-              },
-              create: {
-                websiteId: item.websiteId,
-                date: today,
-                successCount: 1,
-              },
-              update: {
-                successCount: { increment: 1 },
-              },
-            });
-          } else if (linkStatus === 'failed') {
-            await this.prisma.dailyAllocation.upsert({
-              where: {
-                websiteId_date: { websiteId: item.websiteId, date: today },
-              },
-              create: {
-                websiteId: item.websiteId,
-                date: today,
-                failureCount: 1,
-              },
-              update: {
-                failureCount: { increment: 1 },
-              },
-            });
-          }
+        // Chỉ update nếu status thay đổi hoặc chưa được sync
+        const needsUpdate = !item.resultSyncedAt || item.status !== newStatus;
+
+        if (needsUpdate && isCompleted) {
+          itemsToUpdate.push({
+            id: item.id,
+            status: newStatus,
+            completedAt: new Date(),
+            resultSyncedAt: new Date(),
+          });
+        }
+
+        // Thêm vào danh sách websites cần cập nhật stats nếu là SUCCESS hoặc FAILED
+        if (newStatus === AllocationItemStatus.SUCCESS || newStatus === AllocationItemStatus.FAILED) {
           websitesToUpdate.add(item.websiteId);
+
+          // Track daily allocation changes chỉ cho items mới sync hoặc thay đổi status
+          if (needsUpdate && isCompleted) {
+            const key = item.websiteId;
+            if (status === 'finish' || status === 'fail connecting' || status === 'fail_connecting') {
+              dailySuccessMap.set(key, (dailySuccessMap.get(key) || 0) + 1);
+            } else {
+              dailyFailureMap.set(key, (dailyFailureMap.get(key) || 0) + 1);
+            }
+          }
         }
       }
 
       syncedRequests++;
     }
 
+    // BATCH UPDATE: Update all allocation items using transaction
+    if (itemsToUpdate.length > 0) {
+      await this.prisma.$transaction(
+        itemsToUpdate.map((item) =>
+          this.prisma.allocationItem.update({
+            where: { id: item.id },
+            data: {
+              status: item.status,
+              completedAt: item.completedAt,
+              resultSyncedAt: item.resultSyncedAt,
+            },
+          })
+        )
+      );
+    }
+
+    // BATCH UPSERT: Update daily allocations
+    const dailyUpserts: Promise<unknown>[] = [];
+
+    for (const [websiteId, count] of dailySuccessMap) {
+      dailyUpserts.push(
+        this.prisma.dailyAllocation.upsert({
+          where: { websiteId_date: { websiteId, date: today } },
+          create: { websiteId, date: today, successCount: count },
+          update: { successCount: { increment: count } },
+        })
+      );
+    }
+
+    for (const [websiteId, count] of dailyFailureMap) {
+      dailyUpserts.push(
+        this.prisma.dailyAllocation.upsert({
+          where: { websiteId_date: { websiteId, date: today } },
+          create: { websiteId, date: today, failureCount: count },
+          update: { failureCount: { increment: count } },
+        })
+      );
+    }
+
+    if (dailyUpserts.length > 0) {
+      await Promise.all(dailyUpserts);
+    }
 
     // Update WebsiteStats for all affected websites
     if (websitesToUpdate.size > 0) {
@@ -739,6 +788,179 @@ export class AllocationService {
       todayFailure: dailyStats._sum.failureCount || 0,
       pendingBatches,
       totalBatches,
+    };
+  }
+
+  // ==================== FORCE RESYNC ====================
+
+  /**
+   * Force resync tất cả allocation results từ MySQL
+   * Bỏ qua điều kiện resultSyncedAt để sync lại tất cả
+   *
+   * OPTIMIZED: Sử dụng batch queries để giảm số lượng kết nối DB
+   * - 1 query lấy tất cả batches từ PostgreSQL
+   * - 1 query lấy tất cả entity_links từ MySQL (thay vì N queries)
+   * - Transaction để batch update items
+   */
+  async forceResyncAllResults(): Promise<{
+    syncedBatches: number;
+    updatedItems: number;
+    updatedWebsites: number;
+    errors: string[];
+  }> {
+    const errors: string[] = [];
+    let syncedBatches = 0;
+    let updatedItems = 0;
+    const websitesToUpdate = new Set<string>();
+
+    // Lấy tất cả batches đã COMPLETED hoặc PROCESSING
+    const batches = await this.prisma.allocationBatch.findMany({
+      where: {
+        status: {
+          in: [AllocationBatchStatus.COMPLETED, AllocationBatchStatus.PROCESSING],
+        },
+      },
+      include: {
+        items: true,
+      },
+    });
+
+    if (batches.length === 0) {
+      return { syncedBatches: 0, updatedItems: 0, updatedWebsites: 0, errors: [] };
+    }
+
+    this.fastify.log.info(`Force resync: Found ${batches.length} batches to process`);
+
+    // Collect all unique request IDs
+    const requestIds = [...new Set(batches.map((b) => b.externalRequestId))];
+
+    // BATCH QUERY: Lấy tất cả entity_links từ MySQL trong 1 query
+    const allLinksMap = await this.mysqlRepo.entityLink.findByRequestIds(requestIds);
+
+    // Prepare batch updates
+    const itemsToUpdate: Array<{
+      id: string;
+      status: AllocationItemStatus;
+      completedAt: Date | null;
+      resultSyncedAt: Date | null;
+    }> = [];
+
+    for (const batch of batches) {
+      try {
+        const requestId = batch.externalRequestId;
+
+        // Get links for this request from the batch query result
+        const links = allLinksMap.get(requestId) || [];
+        const linkStatusMap = new Map(
+          links.map((l) => [l.site, l.status])
+        );
+
+        // Process each item
+        for (const item of batch.items) {
+          const linkStatus = linkStatusMap.get(item.domain);
+
+          // Determine new status based on entity_link status
+          // Note: MySQL có thể lưu status với dấu gạch dưới hoặc khoảng trắng
+          const status = linkStatus as string;
+          let newStatus: AllocationItemStatus;
+
+          if (!status || status === 'new') {
+            newStatus = AllocationItemStatus.RUNNING;
+          } else if (status === 'finish' || status === 'fail connecting' || status === 'fail_connecting') {
+            newStatus = AllocationItemStatus.SUCCESS;
+          } else if (status === 'cancel') {
+            newStatus = AllocationItemStatus.CANCELLED;
+          } else {
+            newStatus = AllocationItemStatus.FAILED;
+          }
+
+          // Chỉ thêm vào batch update nếu status thay đổi
+          if (item.status !== newStatus) {
+            const isCompleted = status !== 'new' && status !== undefined;
+            itemsToUpdate.push({
+              id: item.id,
+              status: newStatus,
+              completedAt: isCompleted ? new Date() : null,
+              resultSyncedAt: isCompleted ? new Date() : null,
+            });
+          }
+
+          // Thêm vào danh sách websites cần cập nhật stats
+          if (newStatus === AllocationItemStatus.SUCCESS || newStatus === AllocationItemStatus.FAILED) {
+            websitesToUpdate.add(item.websiteId);
+          }
+        }
+
+        syncedBatches++;
+      } catch (error) {
+        const errorMsg = `Error processing batch ${batch.id}: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        errors.push(errorMsg);
+        this.fastify.log.error(errorMsg);
+      }
+    }
+
+    // BATCH UPDATE: Update all allocation items using transaction
+    if (itemsToUpdate.length > 0) {
+      try {
+        await this.prisma.$transaction(
+          itemsToUpdate.map((item) =>
+            this.prisma.allocationItem.update({
+              where: { id: item.id },
+              data: {
+                status: item.status,
+                completedAt: item.completedAt,
+                resultSyncedAt: item.resultSyncedAt,
+              },
+            })
+          )
+        );
+        updatedItems = itemsToUpdate.length;
+      } catch (error) {
+        const errorMsg = `Error batch updating items: ${error instanceof Error ? error.message : 'Unknown error'}`;
+        errors.push(errorMsg);
+        this.fastify.log.error(errorMsg);
+      }
+    }
+
+    // Update WebsiteStats cho tất cả websites bị ảnh hưởng
+    if (websitesToUpdate.size > 0) {
+      this.fastify.log.info(`Updating stats for ${websitesToUpdate.size} websites`);
+      await this.updateWebsiteStats(Array.from(websitesToUpdate));
+    }
+
+    return {
+      syncedBatches,
+      updatedItems,
+      updatedWebsites: websitesToUpdate.size,
+      errors,
+    };
+  }
+
+  /**
+   * Recalculate success rate cho tất cả websites
+   * Dùng khi cần tính lại stats mà không cần sync từ MySQL
+   */
+  async recalculateAllWebsiteStats(): Promise<{
+    updatedWebsites: number;
+  }> {
+    // Lấy tất cả websiteIds có trong allocation_items
+    const websiteIds = await this.prisma.allocationItem.findMany({
+      where: {
+        status: {
+          in: [AllocationItemStatus.SUCCESS, AllocationItemStatus.FAILED],
+        },
+      },
+      select: { websiteId: true },
+      distinct: ['websiteId'],
+    });
+
+    const uniqueIds = websiteIds.map((w) => w.websiteId);
+    this.fastify.log.info(`Recalculating stats for ${uniqueIds.length} websites`);
+
+    await this.updateWebsiteStats(uniqueIds);
+
+    return {
+      updatedWebsites: uniqueIds.length,
     };
   }
 }

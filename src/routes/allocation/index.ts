@@ -47,6 +47,20 @@ const allocationRoutes: FastifyPluginAsync = async (
     { preHandler: [authMiddleware, canViewWebsites] },
     controller.getWebsiteStats.bind(controller)
   );
+
+  // Force resync all allocation results from MySQL - ADMIN, MANAGER only
+  fastify.post(
+    '/force-resync',
+    { preHandler: [authMiddleware, canUpdateWebsites] },
+    controller.forceResync.bind(controller)
+  );
+
+  // Recalculate stats for all websites - ADMIN, MANAGER only
+  fastify.post(
+    '/recalculate-stats',
+    { preHandler: [authMiddleware, canUpdateWebsites] },
+    controller.recalculateStats.bind(controller)
+  );
 };
 
 export default allocationRoutes;

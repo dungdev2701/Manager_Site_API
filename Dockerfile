@@ -12,7 +12,7 @@ COPY package.json pnpm-lock.yaml ./
 # Copy prisma schema (cần cho generate)
 COPY prisma ./prisma
 
-# Cài dependencies
+# Cài tất cả dependencies (cần devDependencies để build)
 RUN pnpm install --frozen-lockfile
 
 # Copy source code
@@ -34,22 +34,24 @@ WORKDIR /app
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
 
-# Cài production dependencies only
+# Chỉ cài production dependencies
 RUN pnpm install --frozen-lockfile --prod
 
-# Copy prisma
+# Copy prisma schema
 COPY prisma ./prisma
+
+# Generate Prisma client trong production (cần thiết)
+RUN pnpm prisma generate
 
 # Copy built files từ builder
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 
 # Expose port
-EXPOSE 3000
+EXPOSE 3005
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3000/ || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:3005/ || exit 1
 
-# Start command
+# Start command - chạy trực tiếp bằng node
 CMD ["node", "dist/app.js"]

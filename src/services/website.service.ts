@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { WebsiteRepository } from '../repositories/website.repository';
 import { UrlHelper } from '../utils/url';
-import { WebsiteStatus, Role, Prisma } from '@prisma/client';
+import { WebsiteStatus, WebsiteType, Role, Prisma } from '@prisma/client';
 
 export interface WebsiteMetrics {
   traffic?: number;
@@ -28,6 +28,7 @@ export interface WebsiteMetrics {
 
 export interface CreateWebsiteInput {
   domain: string;
+  type?: WebsiteType;
   notes?: string;
   metrics?: WebsiteMetrics;
 }
@@ -38,8 +39,9 @@ export interface CreateBulkWebsitesInput {
 
 export interface BulkWebsiteItem {
   domain: string;
+  type?: WebsiteType;
   metrics?: WebsiteMetrics;
-  status?: 'RUNNING' | 'ABANDONED' | 'TESTED' | 'UNTESTED' | 'PENDING' | 'MAINTENANCE' | 'ERROR';
+  status?: 'NEW' | 'CHECKING' | 'HANDING' | 'PENDING' | 'RUNNING' | 'ERROR' | 'MAINTENANCE';
 }
 
 export interface CreateBulkWebsitesWithMetricsInput {
@@ -47,6 +49,7 @@ export interface CreateBulkWebsitesWithMetricsInput {
 }
 
 export interface UpdateWebsiteInput {
+  type?: WebsiteType;
   status?: WebsiteStatus;
   notes?: string;
   metrics?: WebsiteMetrics;
@@ -85,7 +88,8 @@ export class WebsiteService {
     // Tạo website mới
     const website = await this.websiteRepository.create({
       domain,
-      status: WebsiteStatus.UNTESTED,
+      type: input.type || WebsiteType.ENTITY,
+      status: WebsiteStatus.NEW,
       ...(input.notes && { notes: input.notes }),
       ...(input.metrics && { metrics: input.metrics as Prisma.InputJsonValue }),
       ...(createdBy && {
@@ -133,7 +137,7 @@ export class WebsiteService {
     if (newDomains.length > 0) {
       const createData = newDomains.map((domain) => ({
         domain,
-        status: WebsiteStatus.UNTESTED,
+        status: WebsiteStatus.NEW,
         ...(createdBy && { createdBy }),
       }));
 
@@ -161,7 +165,7 @@ export class WebsiteService {
     createdBy?: string
   ): Promise<BulkCreateResult> {
     const invalid: string[] = [];
-    const validWebsites: { domain: string; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
+    const validWebsites: { domain: string; type?: WebsiteType; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
 
     // 1. Extract và validate domains (giữ nguyên subdomain)
     for (const item of input.websites) {
@@ -170,8 +174,9 @@ export class WebsiteService {
         if (domain) {
           validWebsites.push({
             domain,
+            type: item.type,
             metrics: item.metrics,
-            status: item.status ? (item.status as WebsiteStatus) : WebsiteStatus.UNTESTED,
+            status: item.status ? (item.status as WebsiteStatus) : WebsiteStatus.NEW,
           });
         } else {
           invalid.push(item.domain);
@@ -203,7 +208,8 @@ export class WebsiteService {
     if (newWebsites.length > 0) {
       const createData = newWebsites.map((website) => ({
         domain: website.domain,
-        status: website.status || WebsiteStatus.UNTESTED,
+        type: website.type || WebsiteType.ENTITY,
+        status: website.status || WebsiteStatus.NEW,
         ...(website.metrics && { metrics: website.metrics as Prisma.InputJsonValue }),
         ...(createdBy && { createdBy }),
       }));
@@ -222,11 +228,13 @@ export class WebsiteService {
 
   /**
    * Lấy danh sách websites với pagination, filtering và sorting
-   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER)
+   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER, CTV)
+   * Note: CTV chỉ xem được websites do chính họ tạo
    */
   async findAllWebsites(params: {
     page: number;
     limit: number;
+    type?: WebsiteType;
     status?: WebsiteStatus;
     search?: string;
     // Sort options
@@ -238,10 +246,14 @@ export class WebsiteService {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // User info for role-based filtering
+    userId?: string;
+    userRole?: Role;
   }) {
     const {
       page,
       limit,
+      type,
       status,
       search,
       sortBy,
@@ -251,13 +263,19 @@ export class WebsiteService {
       captcha_provider,
       required_gmail,
       verify,
+      userId,
+      userRole,
     } = params;
     const skip = (page - 1) * limit;
+
+    // CTV chỉ xem được websites do chính họ tạo
+    const createdBy = userRole === Role.CTV ? userId : undefined;
 
     // Repository đã tối ưu với Promise.all
     const { websites, total } = await this.websiteRepository.findAll({
       skip,
       take: limit,
+      type,
       status,
       search,
       sortBy,
@@ -267,6 +285,7 @@ export class WebsiteService {
       captcha_provider,
       required_gmail,
       verify,
+      createdBy,
     });
 
     return {
@@ -283,12 +302,20 @@ export class WebsiteService {
   /**
    * Lấy chi tiết 1 website
    * Permission: ALL
+   * Note: CTV chỉ xem được website do chính họ tạo
    */
-  async getWebsite(id: string) {
+  async getWebsite(id: string, userId?: string, userRole?: Role) {
     const website = await this.websiteRepository.findById(id);
 
     if (!website) {
       throw this.fastify.httpErrors.notFound('Website not found');
+    }
+
+    // CTV chỉ xem được website do chính họ tạo
+    if (userRole === Role.CTV && website.createdBy !== userId) {
+      throw this.fastify.httpErrors.forbidden(
+        'CTV chỉ được xem website do chính mình tạo'
+      );
     }
 
     return website;
@@ -296,11 +323,12 @@ export class WebsiteService {
 
   /**
    * Update website
-   * Permission: ADMIN, MANAGER, CHECKER
+   * Permission: ADMIN, MANAGER, CHECKER, CTV
    *
    * Note:
    * - ADMIN, MANAGER: Có thể update cả status và notes
    * - CHECKER: Chỉ nên update notes (fix lỗi) và status (sau khi check)
+   * - CTV: Chỉ được update websites do chính họ tạo
    */
   async updateWebsite(
     id: string,
@@ -308,11 +336,12 @@ export class WebsiteService {
     userId: string,
     userRole: Role
   ) {
-    // Check website exists
-    await this.getWebsite(id);
+    // Check website exists và kiểm tra quyền (CTV chỉ update được website của mình)
+    await this.getWebsite(id, userId, userRole);
 
     // Prepare update data with proper type casting for Prisma
     const updateData: Prisma.WebsiteUpdateInput = {
+      ...(data.type && { type: data.type }),
       ...(data.status && { status: data.status }),
       ...(data.notes !== undefined && { notes: data.notes }),
       ...(data.metrics && { metrics: data.metrics as Prisma.InputJsonValue }),
@@ -406,8 +435,10 @@ export class WebsiteService {
   /**
    * Lấy tất cả website IDs dựa trên filter
    * Permission: ALL
+   * Note: CTV chỉ lấy được IDs của websites do chính họ tạo
    */
   async getAllWebsiteIds(params: {
+    type?: WebsiteType;
     status?: WebsiteStatus;
     search?: string;
     index?: 'yes' | 'no';
@@ -415,8 +446,19 @@ export class WebsiteService {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // User info for role-based filtering
+    userId?: string;
+    userRole?: Role;
   }): Promise<string[]> {
-    return this.websiteRepository.findAllIds(params);
+    const { userId, userRole, ...filterParams } = params;
+
+    // CTV chỉ lấy được IDs của websites do chính họ tạo
+    const createdBy = userRole === Role.CTV ? userId : undefined;
+
+    return this.websiteRepository.findAllIds({
+      ...filterParams,
+      createdBy,
+    });
   }
 
   /**

@@ -15,7 +15,13 @@ import {
  *    - Nếu quá timeout -> chuyển sang "connecting", new -> cancel, finish -> connect
  *
  * 2. Request đang "connecting":
- *    - Nếu không còn link nào ở trạng thái xử lý (profiling, connecting, connect, registering)
+ *    - Nếu không còn link nào ở trạng thái xử lý (connecting, connect)
+ *      -> chuyển sang "completed"
+ *    - HOẶC nếu quá thời gian connecting timeout (= 1/6 running timeout)
+ *      -> update các link stuck sang fail status:
+ *         + connect/connecting -> fail connecting
+ *         + registering -> fail registering
+ *         + profiling -> fail profiling
  *      -> chuyển sang "completed"
  */
 export class RequestStatusCheckerService {
@@ -35,6 +41,7 @@ export class RequestStatusCheckerService {
     transitionedToConnecting: number;
     transitionedToCompleted: number;
     timedOut: number;
+    connectingTimedOut: number;
   }> {
     const result = {
       runningChecked: 0,
@@ -42,6 +49,7 @@ export class RequestStatusCheckerService {
       transitionedToConnecting: 0,
       transitionedToCompleted: 0,
       timedOut: 0,
+      connectingTimedOut: 0,
     };
 
     // 1. Check running requests
@@ -76,21 +84,35 @@ export class RequestStatusCheckerService {
       const connectingIds = connectingRequests.map((r) => r.id);
       const hasProcessingMap = await this.mysqlRepo.entityLink.hasProcessingLinksBatch(connectingIds);
 
-      // Lấy link counts cho các request sẽ transition sang completed (để log)
-      const willCompleteIds = connectingIds.filter((id) => !hasProcessingMap.get(String(id)));
-      const linkCountsMap =
-        willCompleteIds.length > 0
-          ? await this.mysqlRepo.entityLink.countByStatusBatch(willCompleteIds)
-          : new Map();
-
       for (const request of connectingRequests) {
         const hasProcessing = hasProcessingMap.get(String(request.id));
-        if (!hasProcessing) {
-          const linkCounts = linkCountsMap.get(String(request.id));
+        const isConnectingTimedOut = this.mysqlRepo.entityRequest.isConnectingTimedOut(request);
+
+        // Điều kiện chuyển sang completed:
+        // 1. Không còn link nào đang xử lý (connect, connecting)
+        // 2. HOẶC đã quá thời gian connecting timeout (1/6 timeout gốc)
+        if (!hasProcessing || isConnectingTimedOut) {
+          // Nếu timeout, update các link stuck sang fail status trước
+          if (isConnectingTimedOut && hasProcessing) {
+            const updateResult = await this.mysqlRepo.entityLink.updateStuckLinksOnConnectingTimeout(request.id);
+            const connectingTimeoutMinutes = EntityRequestRepository.calculateConnectingTimeoutMinutes(request.entity_limit);
+
+            this.fastify.log.info(
+              `Request ${request.id}: connecting timeout (${connectingTimeoutMinutes}m), updated ${updateResult.updated} stuck links to fail status`
+            );
+            result.connectingTimedOut++;
+          }
+
+          // Lấy link counts để log
+          const linkCounts = await this.mysqlRepo.entityLink.countByStatus(request.id);
+
+          // Chuyển trạng thái request sang completed
           await this.mysqlRepo.entityRequest.updateStatus(request.id, 'completed');
 
           this.fastify.log.info(
-            `Request ${request.id}: connecting → completed (finish: ${linkCounts?.finish || 0}/${request.entity_limit})`
+            `Request ${request.id}: connecting → completed (finish: ${linkCounts.finish}/${request.entity_limit}, ` +
+            `fail connecting: ${linkCounts['fail connecting']}, fail registering: ${linkCounts['fail registering']}, ` +
+            `fail profiling: ${linkCounts['fail profiling']})`
           );
           result.transitionedToCompleted++;
         }

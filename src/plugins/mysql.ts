@@ -10,50 +10,119 @@ declare module 'fastify' {
   }
 }
 
-// MySQL Client wrapper với các helper methods
+// Retryable error codes - connection issues that can be recovered
+const RETRYABLE_ERRORS = [
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'PROTOCOL_CONNECTION_LOST',
+  'ER_CON_COUNT_ERROR',
+  'EPIPE',
+];
+
+// MySQL Client wrapper với các helper methods và retry logic
 export class MySQLClient {
   private pool: Pool;
+  private maxRetries = 3;
+  private retryDelay = 500; // Start with 500ms, will increase exponentially
 
   constructor(pool: Pool) {
     this.pool = pool;
   }
 
   /**
-   * Get a connection from the pool
+   * Check if error is retryable (connection issues)
    */
-  async getConnection(): Promise<PoolConnection> {
-    return this.pool.getConnection();
+  private isRetryableError(error: unknown): boolean {
+    if (error instanceof Error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code ? RETRYABLE_ERRORS.includes(code) : false;
+    }
+    return false;
   }
 
   /**
-   * Execute a query and return rows
+   * Sleep for a given time
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Get a connection from the pool with retry
+   */
+  async getConnection(): Promise<PoolConnection> {
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await this.pool.getConnection();
+      } catch (error) {
+        lastError = error as Error;
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          await this.sleep(this.retryDelay * attempt); // Exponential backoff
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Execute a query and return rows with retry
    */
   async query<T extends RowDataPacket[]>(
     sql: string,
     params?: unknown[]
   ): Promise<T> {
-    const [rows] = await this.pool.query<T>(sql, params);
-    return rows;
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const [rows] = await this.pool.query<T>(sql, params);
+        return rows;
+      } catch (error) {
+        lastError = error as Error;
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          await this.sleep(this.retryDelay * attempt);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
   }
 
   /**
-   * Execute an insert/update/delete query
+   * Execute an insert/update/delete query with retry
    */
   async execute(
     sql: string,
     params?: unknown[]
   ): Promise<ResultSetHeader> {
-    const [result] = await this.pool.execute<ResultSetHeader>(sql, params);
-    return result;
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      try {
+        const [result] = await this.pool.execute<ResultSetHeader>(sql, params);
+        return result;
+      } catch (error) {
+        lastError = error as Error;
+        if (this.isRetryableError(error) && attempt < this.maxRetries) {
+          await this.sleep(this.retryDelay * attempt);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
   }
 
   /**
-   * Execute multiple queries in a transaction
+   * Execute multiple queries in a transaction with retry for getting connection
    */
   async transaction<T>(
     callback: (connection: PoolConnection) => Promise<T>
   ): Promise<T> {
-    const connection = await this.pool.getConnection();
+    const connection = await this.getConnection(); // Uses retry logic
     try {
       await connection.beginTransaction();
       const result = await callback(connection);

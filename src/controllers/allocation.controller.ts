@@ -118,4 +118,38 @@ export class AllocationController {
       });
     }
   }
+
+  /**
+   * POST /allocation/force-resync
+   * Force resync tất cả allocation results từ MySQL
+   * Bỏ qua điều kiện resultSyncedAt để sync lại tất cả
+   */
+  async forceResync(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.service.forceResyncAllResults();
+    reply.send({
+      success: true,
+      message: 'Force resync completed',
+      data: result,
+    });
+  }
+
+  /**
+   * POST /allocation/recalculate-stats
+   * Recalculate success rate cho tất cả websites
+   * Dùng khi cần tính lại stats mà không cần sync từ MySQL
+   */
+  async recalculateStats(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.service.recalculateAllWebsiteStats();
+    reply.send({
+      success: true,
+      message: 'Stats recalculated',
+      data: result,
+    });
+  }
 }

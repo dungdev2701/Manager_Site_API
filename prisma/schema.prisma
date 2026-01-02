@@ -29,17 +29,19 @@ model User {
 }
 
 enum Role {
-  ADMIN
-  MANAGER
-  CHECKER
-  VIEWER
+  ADMIN     // Quản trị viên - toàn quyền
+  MANAGER   // Quản lý - quản lý websites và users
+  CHECKER   // Kiểm tra viên - test và cập nhật websites
+  CTV       // Cộng tác viên - quyền hạn chế
+  VIEWER    // Xem - chỉ xem, không chỉnh sửa
 }
 
 // ==================== WEBSITE/DOMAIN MANAGEMENT ====================
 model Website {
   id          String         @id @default(uuid())
   domain      String         @unique
-  status      WebsiteStatus  @default(UNTESTED)
+  type        WebsiteType    @default(ENTITY)
+  status      WebsiteStatus  @default(NEW)
   notes       String?        @db.Text // Notes from CHECKER (combined note and error details)
 
   // Metrics stored as JSONB - flexible for adding new metrics
@@ -69,6 +71,7 @@ model Website {
   stats            WebsiteStats[]
   allocationItems  AllocationItem[]
 
+  @@index([type])
   @@index([status])
   @@index([domain])
   @@index([createdBy])
@@ -79,13 +82,20 @@ model Website {
 }
 
 enum WebsiteStatus {
-  RUNNING       // Đang chạy
-  ABANDONED     // Bỏ
-  TESTED        // Đã test
-  UNTESTED      // Chưa test
-  PENDING       // Đang chờ test
-  MAINTENANCE   // Đang bảo trì
+  NEW           // Mới thêm vào hệ thống
+  CHECKING      // Đang trong quá trình CTV check
+  HANDING       // Đội CTV test tay
+  PENDING       // Chờ dev phát triển trên tool
+  RUNNING       // Đã sẵn sàng vào hệ thống
   ERROR         // Lỗi
+  MAINTENANCE   // Đang bảo trì
+}
+
+enum WebsiteType {
+  ENTITY        // Entity
+  BLOG2         // Blog 2.0
+  PODCAST       // Podcast
+  SOCIAL        // Social
 }
 
 enum CheckType {

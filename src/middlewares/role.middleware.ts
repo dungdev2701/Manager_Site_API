@@ -26,22 +26,24 @@ export function requireRole(...allowedRoles: Role[]) {
  * Các helper functions cho từng permission
  */
 
-// View: Tất cả roles
+// View: Tất cả roles (CTV chỉ xem website của chính họ - filter trong service)
 export const canViewWebsites = requireRole(
   Role.ADMIN,
   Role.MANAGER,
   Role.CHECKER,
-  Role.VIEWER
+  Role.VIEWER,
+  Role.CTV
 );
 
-// Create: ADMIN, MANAGER
-export const canCreateWebsites = requireRole(Role.ADMIN, Role.MANAGER);
+// Create: ADMIN, MANAGER, CTV
+export const canCreateWebsites = requireRole(Role.ADMIN, Role.MANAGER, Role.CTV);
 
-// Update: ADMIN, MANAGER, CHECKER
+// Update: ADMIN, MANAGER, CHECKER, CTV (CTV chỉ được update website của chính họ - check trong controller)
 export const canUpdateWebsites = requireRole(
   Role.ADMIN,
   Role.MANAGER,
-  Role.CHECKER
+  Role.CHECKER,
+  Role.CTV
 );
 
 // Delete: ADMIN only

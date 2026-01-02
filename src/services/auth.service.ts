@@ -103,7 +103,7 @@ export class AuthService {
     // Find user by email
     const user = await this.userRepository.findByEmail(input.email);
     if (!user) {
-      throw this.fastify.httpErrors.unauthorized('Invalid credentials');
+      throw this.fastify.httpErrors.unauthorized('Email không tồn tại trong hệ thống');
     }
 
     // Verify password
@@ -112,12 +112,12 @@ export class AuthService {
       user.password
     );
     if (!isPasswordValid) {
-      throw this.fastify.httpErrors.unauthorized('Invalid credentials');
+      throw this.fastify.httpErrors.unauthorized('Mật khẩu không chính xác');
     }
 
     // Check if user is active
     if (!user.isActive) {
-      throw this.fastify.httpErrors.forbidden('Account is not active');
+      throw this.fastify.httpErrors.forbidden('Tài khoản đã bị vô hiệu hóa');
     }
 
     // Generate tokens

@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
 /**
+ * Enum cho loại website
+ */
+export const websiteTypeEnum = z.enum(['ENTITY', 'BLOG2', 'PODCAST', 'SOCIAL']);
+
+/**
  * Schema cho metrics của website
  */
 export const websiteMetricsSchema = z.object({
@@ -13,7 +18,7 @@ export const websiteMetricsSchema = z.object({
   // Index
   index: z.enum(['yes', 'no']).optional(),
   // About
-  about: z.enum(['no_stacking', 'stacking_post', 'stacking_about']).optional(),
+  about: z.enum(['no_stacking', 'stacking_post', 'stacking_about', 'long_about']).optional(),
   about_max_chars: z.number().min(0).optional(), // Max characters allowed for about
   // Other fields
   username: z.enum(['unique', 'duplicate', 'no']).optional(), // Unique: không trùng, Duplicate: được trùng, No: không có username
@@ -50,6 +55,7 @@ export const createWebsiteSchema = z.object({
       },
       { message: 'Invalid domain format. Examples: abc.com, blog.shinobi.jp, https://example.com' }
     ),
+  type: websiteTypeEnum.optional(), // Default ENTITY in database
   notes: z.string().max(5000).optional(),
   metrics: websiteMetricsSchema,
 });
@@ -59,9 +65,10 @@ export const createWebsiteSchema = z.object({
  */
 export const bulkWebsiteItemSchema = z.object({
   domain: z.string().min(1),
+  type: websiteTypeEnum.optional(), // Default ENTITY in database
   metrics: websiteMetricsSchema,
   status: z
-    .enum(['RUNNING', 'ABANDONED', 'TESTED', 'UNTESTED', 'PENDING', 'MAINTENANCE', 'ERROR'])
+    .enum(['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'])
     .optional(),
 });
 
@@ -89,8 +96,9 @@ export const createBulkWebsitesWithMetricsSchema = z.object({
  * Schema cho việc update website
  */
 export const updateWebsiteSchema = z.object({
+  type: websiteTypeEnum.optional(),
   status: z
-    .enum(['RUNNING', 'ABANDONED', 'TESTED', 'UNTESTED', 'PENDING', 'MAINTENANCE', 'ERROR'])
+    .enum(['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'])
     .optional(),
   notes: z.string().max(5000).optional(),
   metrics: websiteMetricsSchema,
@@ -110,8 +118,9 @@ export const websiteQuerySchema = z.object({
     .regex(/^\d+$/)
     .transform(Number)
     .default('10'),
+  type: websiteTypeEnum.optional(), // Filter by type
   status: z
-    .enum(['RUNNING', 'ABANDONED', 'TESTED', 'UNTESTED', 'PENDING', 'MAINTENANCE', 'ERROR'])
+    .enum(['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'])
     .optional(),
   search: z.string().optional(), // Tìm kiếm theo domain
   // Sort options
@@ -126,6 +135,7 @@ export const websiteQuerySchema = z.object({
 });
 
 // Export types
+export type WebsiteTypeDTO = z.infer<typeof websiteTypeEnum>;
 export type WebsiteMetricsDTO = z.infer<typeof websiteMetricsSchema>;
 export type CreateWebsiteDTO = z.infer<typeof createWebsiteSchema>;
 export type CreateBulkWebsitesDTO = z.infer<typeof createBulkWebsitesSchema>;

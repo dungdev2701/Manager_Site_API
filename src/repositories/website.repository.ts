@@ -1,4 +1,4 @@
-import { PrismaClient, Website, Prisma, WebsiteStatus } from '@prisma/client';
+import { PrismaClient, Website, Prisma, WebsiteStatus, WebsiteType } from '@prisma/client';
 
 export class WebsiteRepository {
   constructor(private prisma: PrismaClient) {}
@@ -60,6 +60,7 @@ export class WebsiteRepository {
   async findAll(params: {
     skip?: number;
     take?: number;
+    type?: WebsiteType;
     status?: WebsiteStatus;
     search?: string;
     // Sort options
@@ -71,10 +72,13 @@ export class WebsiteRepository {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // Filter by ownership (for CTV)
+    createdBy?: string;
   }) {
     const {
       skip,
       take,
+      type,
       status,
       search,
       sortBy,
@@ -84,11 +88,13 @@ export class WebsiteRepository {
       captcha_provider,
       required_gmail,
       verify,
+      createdBy,
     } = params;
 
     // Build where clause with metrics filters
     const where: Prisma.WebsiteWhereInput = {
       deletedAt: null, // Only get active websites (not soft deleted)
+      ...(type && { type }),
       ...(status && { status }),
       ...(search && {
         domain: {
@@ -96,6 +102,8 @@ export class WebsiteRepository {
           mode: 'insensitive' as Prisma.QueryMode,
         },
       }),
+      // Filter by ownership (for CTV role)
+      ...(createdBy && { createdBy }),
     };
 
     // Add metrics filters using Prisma's JSON filtering
@@ -125,15 +133,17 @@ export class WebsiteRepository {
     }
 
     // Build orderBy clause
+    // Default sort by traffic (desc) if no sortBy specified
+    const effectiveSortBy = sortBy || 'traffic';
     let orderBy: Prisma.WebsiteOrderByWithRelationInput = { createdAt: 'desc' };
-    if (sortBy === 'createdAt') {
+    if (effectiveSortBy === 'createdAt') {
       orderBy = { createdAt: sortOrder };
-    } else if (sortBy === 'status') {
+    } else if (effectiveSortBy === 'status') {
       orderBy = { status: sortOrder };
     }
     // Note: For JSONB fields (traffic, DA), we'll sort in memory after fetching
     // because Prisma doesn't support direct JSONB field ordering
-    const needsJsonSort = sortBy === 'traffic' || sortBy === 'DA';
+    const needsJsonSort = effectiveSortBy === 'traffic' || effectiveSortBy === 'DA';
 
     // OPTIMIZATION: Chạy 2 queries song song thay vì tuần tự
     const [websites, total] = await Promise.all([
@@ -145,6 +155,7 @@ export class WebsiteRepository {
         select: {
           id: true,
           domain: true,
+          type: true,
           status: true,
           notes: true,
           metrics: true,
@@ -198,12 +209,12 @@ export class WebsiteRepository {
     });
 
     // Sort by JSON field if needed
-    if (needsJsonSort && sortBy) {
+    if (needsJsonSort) {
       websitesWithStats.sort((a, b) => {
         const metricsA = a.metrics as Record<string, unknown> | null;
         const metricsB = b.metrics as Record<string, unknown> | null;
-        const valueA = (metricsA?.[sortBy] as number) ?? 0;
-        const valueB = (metricsB?.[sortBy] as number) ?? 0;
+        const valueA = (metricsA?.[effectiveSortBy] as number) ?? 0;
+        const valueB = (metricsB?.[effectiveSortBy] as number) ?? 0;
 
         if (sortOrder === 'desc') {
           return valueB - valueA;
@@ -323,6 +334,7 @@ export class WebsiteRepository {
         select: {
           id: true,
           domain: true,
+          type: true,
           status: true,
           notes: true,
           metrics: true,
@@ -368,13 +380,13 @@ export class WebsiteRepository {
     });
 
     const result: Record<string, number> = {
-      RUNNING: 0,
-      ABANDONED: 0,
-      TESTED: 0,
-      UNTESTED: 0,
+      NEW: 0,
+      CHECKING: 0,
+      HANDING: 0,
       PENDING: 0,
-      MAINTENANCE: 0,
+      RUNNING: 0,
       ERROR: 0,
+      MAINTENANCE: 0,
     };
 
     counts.forEach((item) => {
@@ -388,6 +400,7 @@ export class WebsiteRepository {
    * Lấy tất cả website IDs dựa trên filter
    */
   async findAllIds(params: {
+    type?: WebsiteType;
     status?: WebsiteStatus;
     search?: string;
     index?: 'yes' | 'no';
@@ -395,8 +408,11 @@ export class WebsiteRepository {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // Filter by ownership (for CTV)
+    createdBy?: string;
   }): Promise<string[]> {
     const {
+      type,
       status,
       search,
       index,
@@ -404,11 +420,13 @@ export class WebsiteRepository {
       captcha_provider,
       required_gmail,
       verify,
+      createdBy,
     } = params;
 
     // Build where clause with metrics filters
     const where: Prisma.WebsiteWhereInput = {
       deletedAt: null,
+      ...(type && { type }),
       ...(status && { status }),
       ...(search && {
         domain: {
@@ -416,6 +434,8 @@ export class WebsiteRepository {
           mode: 'insensitive' as Prisma.QueryMode,
         },
       }),
+      // Filter by ownership (for CTV role)
+      ...(createdBy && { createdBy }),
     };
 
     // Add metrics filters
@@ -462,6 +482,7 @@ export class WebsiteRepository {
       select: {
         id: true,
         domain: true,
+        type: true,
         status: true,
         notes: true,
         metrics: true,

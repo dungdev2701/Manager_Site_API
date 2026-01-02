@@ -48,14 +48,15 @@ export type EntityLinkStatus =
   | 'finish'           // Hoàn thành
   | 'failed'           // Thất bại
   | 'cancel'           // Đã hủy
-  | 'fail_registering' // Đăng ký thất bại (có thể retry)
-  | 'fail_profiling';  // Tạo profile thất bại (có thể retry)
+  | 'fail registering' // Đăng ký thất bại (có thể retry)
+  | 'fail profiling'   // Tạo profile thất bại (có thể retry)
+  | 'fail connecting'; // Kết nối thất bại (timeout connecting phase)
 
 // Các status được coi là "đang xử lý"
 export const PROCESSING_STATUSES: EntityLinkStatus[] = ['profiling', 'connecting', 'connect', 'registering'];
 
 // Các status có thể retry
-export const RETRYABLE_STATUSES: EntityLinkStatus[] = ['fail_registering', 'fail_profiling'];
+export const RETRYABLE_STATUSES: EntityLinkStatus[] = ['fail registering', 'fail profiling'];
 
 export interface EntityLink extends RowDataPacket {
   id: string; // UUID
@@ -113,6 +114,7 @@ export interface LinkStatusCount {
   finish: number;
   failed: number;
   cancel: number;
-  fail_registering: number;
-  fail_profiling: number;
+  'fail registering': number;
+  'fail profiling': number;
+  'fail connecting': number;
 }

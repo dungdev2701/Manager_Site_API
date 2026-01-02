@@ -91,7 +91,7 @@ export class EntityRequestRepository {
   }
 
   /**
-   * Kiểm tra request đã quá thời gian chạy chưa
+   * Kiểm tra request đã quá thời gian chạy chưa (cho phase RUNNING)
    */
   isRequestTimedOut(request: EntityRequest): boolean {
     if (!request.updatedAt) return false;
@@ -101,5 +101,63 @@ export class EntityRequestRepository {
     const elapsed = Date.now() - new Date(request.updatedAt).getTime();
 
     return elapsed > timeoutMs;
+  }
+
+  /**
+   * Tính thời gian timeout tổng bao gồm cả connecting phase
+   * Total timeout = running timeout + connecting timeout
+   * Connecting timeout = running timeout / 6
+   * => Total timeout = running timeout * 7/6
+   */
+  static calculateTotalTimeoutMinutes(entityLimit: number): number {
+    const runningTimeout = EntityRequestRepository.calculateTimeoutMinutes(entityLimit);
+    // Connecting phase = 1/6 của running timeout
+    // Total = running + connecting = running * (1 + 1/6) = running * 7/6
+    return Math.ceil(runningTimeout * 7 / 6);
+  }
+
+  /**
+   * Tính thời gian connecting timeout riêng (1/6 của running timeout)
+   */
+  static calculateConnectingTimeoutMinutes(entityLimit: number): number {
+    const runningTimeout = EntityRequestRepository.calculateTimeoutMinutes(entityLimit);
+    return Math.ceil(runningTimeout / 6);
+  }
+
+  /**
+   * Kiểm tra request đang ở phase CONNECTING đã quá timeout chưa
+   * Timeout connecting = 1/6 thời gian timeout gốc
+   * Tính từ thời điểm updatedAt (lúc chuyển sang connecting)
+   */
+  isConnectingTimedOut(request: EntityRequest): boolean {
+    if (!request.updatedAt || request.status !== 'connecting') return false;
+
+    const connectingTimeoutMinutes = EntityRequestRepository.calculateConnectingTimeoutMinutes(request.entity_limit);
+    const connectingTimeoutMs = connectingTimeoutMinutes * 60 * 1000;
+    const elapsed = Date.now() - new Date(request.updatedAt).getTime();
+
+    return elapsed > connectingTimeoutMs;
+  }
+
+  /**
+   * Lấy nhiều EntityRequest theo danh sách IDs (batch query)
+   */
+  async findByIds(ids: (number | string)[]): Promise<EntityRequest[]> {
+    if (ids.length === 0) return [];
+
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.mysql.query<EntityRequest[]>(
+      `SELECT * FROM entity_request WHERE id IN (${placeholders})`,
+      ids
+    );
+  }
+
+  /**
+   * Lấy danh sách EntityRequest đã completed
+   */
+  async findCompleted(): Promise<EntityRequest[]> {
+    return this.mysql.query<EntityRequest[]>(
+      `SELECT * FROM entity_request WHERE status = 'completed' ORDER BY updatedAt DESC`
+    );
   }
 }

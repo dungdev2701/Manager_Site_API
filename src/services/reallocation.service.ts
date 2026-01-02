@@ -47,7 +47,7 @@ interface ReallocationResult {
  *    VÀ chưa hết timeout
  * 3. Thì:
  *    - Ưu tiên 1: Phân bổ thêm website mới (2.5x số còn thiếu)
- *    - Ưu tiên 2: Retry các link fail_registering/fail_profiling
+ *    - Ưu tiên 2: Retry các link fail registering/fail profiling
  */
 export class ReallocationService {
   private prisma: PrismaClient;

@@ -108,7 +108,8 @@ export class WebsiteController {
   /**
    * Lấy danh sách TẤT CẢ websites với filtering và sorting
    * GET /websites
-   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER)
+   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER, CTV)
+   * Note: CTV chỉ xem được websites do chính họ tạo
    */
   static async findAll(request: FastifyRequest, reply: FastifyReply) {
     if (!request.user) {
@@ -118,11 +119,12 @@ export class WebsiteController {
     // Validate query params
     const query: WebsiteQueryDTO = websiteQuerySchema.parse(request.query);
 
-    // Get websites (không filter theo userId)
+    // Get websites (CTV sẽ được filter theo userId)
     const websiteService = new WebsiteService(request.server);
     const result = await websiteService.findAllWebsites({
       page: query.page,
       limit: query.limit,
+      type: query.type,
       status: query.status,
       search: query.search,
       // Sort options
@@ -134,6 +136,9 @@ export class WebsiteController {
       captcha_provider: query.captcha_provider,
       required_gmail: query.required_gmail,
       verify: query.verify,
+      // User info for role-based filtering
+      userId: request.user.id,
+      userRole: request.user.role as Role,
     });
 
     return ResponseHelper.success(reply, result);
@@ -143,6 +148,7 @@ export class WebsiteController {
    * Lấy chi tiết 1 website
    * GET /websites/:id
    * Permission: ALL
+   * Note: CTV chỉ xem được website do chính họ tạo
    */
   static async findOne(request: FastifyRequest, reply: FastifyReply) {
     if (!request.user) {
@@ -152,7 +158,11 @@ export class WebsiteController {
     const { id } = request.params as { id: string };
 
     const websiteService = new WebsiteService(request.server);
-    const website = await websiteService.getWebsite(id);
+    const website = await websiteService.getWebsite(
+      id,
+      request.user.id,
+      request.user.role as Role
+    );
 
     return ResponseHelper.success(reply, website);
   }
@@ -283,6 +293,7 @@ export class WebsiteController {
    * Lấy tất cả website IDs dựa trên filter (để hỗ trợ Select All)
    * GET /websites/all-ids
    * Permission: ALL
+   * Note: CTV chỉ lấy được IDs của websites do chính họ tạo
    */
   static async getAllIds(request: FastifyRequest, reply: FastifyReply) {
     if (!request.user) {
@@ -294,6 +305,7 @@ export class WebsiteController {
 
     const websiteService = new WebsiteService(request.server);
     const ids = await websiteService.getAllWebsiteIds({
+      type: query.type,
       status: query.status,
       search: query.search,
       index: query.index,
@@ -301,6 +313,9 @@ export class WebsiteController {
       captcha_provider: query.captcha_provider,
       required_gmail: query.required_gmail,
       verify: query.verify,
+      // User info for role-based filtering
+      userId: request.user.id,
+      userRole: request.user.role as Role,
     });
 
     return ResponseHelper.success(reply, { ids, total: ids.length });

@@ -160,8 +160,9 @@ export class EntityLinkRepository {
       finish: 0,
       failed: 0,
       cancel: 0,
-      fail_registering: 0,
-      fail_profiling: 0,
+      'fail registering': 0,
+      'fail profiling': 0,
+      'fail connecting': 0,
     };
 
     for (const row of rows) {
@@ -266,8 +267,9 @@ export class EntityLinkRepository {
         finish: 0,
         failed: 0,
         cancel: 0,
-        fail_registering: 0,
-        fail_profiling: 0,
+        'fail registering': 0,
+        'fail profiling': 0,
+        'fail connecting': 0,
       });
     }
 
@@ -413,5 +415,62 @@ export class EntityLinkRepository {
       [entityRequestId]
     );
     return rows.map((r) => r.site);
+  }
+
+  /**
+   * Update các link đang stuck khi connecting phase timeout
+   * - connect/connecting -> fail connecting
+   * - registering -> fail registering
+   * - profiling -> fail profiling
+   */
+  async updateStuckLinksOnConnectingTimeout(
+    entityRequestId: number | string
+  ): Promise<{ updated: number; details: Record<string, number> }> {
+    const updates: Array<{ from: EntityLinkStatus; to: EntityLinkStatus }> = [
+      { from: 'connect', to: 'fail connecting' },
+      { from: 'connecting', to: 'fail connecting' },
+      { from: 'registering', to: 'fail registering' },
+      { from: 'profiling', to: 'fail profiling' },
+    ];
+
+    const updated = await this.updateMultipleStatusBulk(entityRequestId, updates);
+
+    return {
+      updated,
+      details: {
+        'connect/connecting -> fail connecting': updated,
+        'registering -> fail registering': updated,
+        'profiling -> fail profiling': updated,
+      },
+    };
+  }
+
+  /**
+   * Lấy EntityLinks theo nhiều entityRequestIds (batch query)
+   * Chỉ 1 query cho tất cả requests - tối ưu kết nối DB
+   */
+  async findByRequestIds(entityRequestIds: (number | string)[]): Promise<Map<string, EntityLink[]>> {
+    if (entityRequestIds.length === 0) return new Map();
+
+    const placeholders = entityRequestIds.map(() => '?').join(', ');
+    const rows = await this.mysql.query<EntityLink[]>(
+      `SELECT * FROM entity_link WHERE entityRequestId IN (${placeholders})`,
+      entityRequestIds
+    );
+
+    // Group by entityRequestId
+    const resultMap = new Map<string, EntityLink[]>();
+    for (const id of entityRequestIds) {
+      resultMap.set(String(id), []);
+    }
+    for (const row of rows) {
+      const requestId = String(row.entityRequestId);
+      const links = resultMap.get(requestId);
+      if (links) {
+        links.push(row);
+      }
+    }
+
+    return resultMap;
   }
 }
