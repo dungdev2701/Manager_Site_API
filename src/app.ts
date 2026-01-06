@@ -16,9 +16,26 @@ const app: FastifyPluginAsync<AppOptions> = async (fastify, opts): Promise<void>
   // Set global error handler
   fastify.setErrorHandler(errorHandler);
 
+  // Log all incoming requests
+  fastify.addHook('onRequest', async (request) => {
+    request.log.info({ url: request.url, method: request.method }, 'incoming request');
+  });
+
+  // Log response with timing
+  fastify.addHook('onResponse', async (request, reply) => {
+    request.log.info(
+      {
+        url: request.url,
+        method: request.method,
+        statusCode: reply.statusCode,
+        responseTime: `${reply.elapsedTime?.toFixed(2) || 0}ms`,
+      },
+      'request completed'
+    );
+  });
+
   // Log startup
   fastify.log.info(`Starting application in ${config.env} mode`);
-  fastify.log.info(`Routes directory: ${join(__dirname, 'routes')}`);
 
   // Load plugins
   await fastify.register(AutoLoad, {
@@ -34,13 +51,6 @@ const app: FastifyPluginAsync<AppOptions> = async (fastify, opts): Promise<void>
       dirNameRoutePrefix: true,
     });
   }, { prefix: '/api' });
-
-  // Log all registered routes after server is ready
-  fastify.addHook('onReady', async () => {
-    fastify.log.info('=== Registered Routes ===');
-    const routes = fastify.printRoutes();
-    fastify.log.info(routes);
-  });
 };
 
 export default app;
