@@ -108,7 +108,7 @@ export class WebsiteController {
   /**
    * Lấy danh sách TẤT CẢ websites với filtering và sorting
    * GET /websites
-   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER, CTV)
+   * Permission: ALL (ADMIN, MANAGER, DEV, CTV, CHECKER)
    * Note: CTV chỉ xem được websites do chính họ tạo
    */
   static async findAll(request: FastifyRequest, reply: FastifyReply) {
@@ -187,7 +187,11 @@ export class WebsiteController {
       id,
       validatedData,
       request.user.id,
-      request.user.role as Role
+      request.user.role as Role,
+      {
+        ipAddress: request.ip,
+        userAgent: request.headers['user-agent'],
+      }
     );
 
     return ResponseHelper.success(

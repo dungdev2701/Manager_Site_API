@@ -30,18 +30,19 @@ export function requireRole(...allowedRoles: Role[]) {
 export const canViewWebsites = requireRole(
   Role.ADMIN,
   Role.MANAGER,
-  Role.CHECKER,
-  Role.VIEWER,
-  Role.CTV
+  Role.DEV,
+  Role.CTV,
+  Role.CHECKER
 );
 
 // Create: ADMIN, MANAGER, CTV
 export const canCreateWebsites = requireRole(Role.ADMIN, Role.MANAGER, Role.CTV);
 
-// Update: ADMIN, MANAGER, CHECKER, CTV (CTV chỉ được update website của chính họ - check trong controller)
+// Update: ADMIN, MANAGER, DEV, CHECKER, CTV (CTV chỉ được update website của chính họ - check trong controller)
 export const canUpdateWebsites = requireRole(
   Role.ADMIN,
   Role.MANAGER,
+  Role.DEV,
   Role.CHECKER,
   Role.CTV
 );

@@ -31,9 +31,9 @@ model User {
 enum Role {
   ADMIN     // Quản trị viên - toàn quyền
   MANAGER   // Quản lý - quản lý websites và users
-  CHECKER   // Kiểm tra viên - test và cập nhật websites
-  CTV       // Cộng tác viên - quyền hạn chế
-  VIEWER    // Xem - chỉ xem, không chỉnh sửa
+  DEV       // Developer - phát triển tool
+  CTV       // Cộng tác viên - thêm và test website
+  CHECKER   // Kiểm tra viên - kiểm tra website
 }
 
 // ==================== WEBSITE/DOMAIN MANAGEMENT ====================

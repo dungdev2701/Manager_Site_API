@@ -1,5 +1,6 @@
 import { FastifyPluginAsync } from 'fastify';
 import { WebsiteController } from '../../controllers/website.controller';
+import { PerformanceController } from '../../controllers/performance.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
 import {
   canViewWebsites,
@@ -101,6 +102,21 @@ const websiteRoutes: FastifyPluginAsync = async (
     '/permanent/:id',
     { preHandler: [authMiddleware, canDeleteWebsites] },
     WebsiteController.permanentDelete
+  );
+
+  // ==================== PERFORMANCE ====================
+  // Get website performance data - ALL can view
+  fastify.get(
+    '/performance/:id',
+    { preHandler: [authMiddleware, canViewWebsites] },
+    PerformanceController.getPerformance
+  );
+
+  // Compare performance between two periods - ALL can view
+  fastify.get(
+    '/performance/:id/compare',
+    { preHandler: [authMiddleware, canViewWebsites] },
+    PerformanceController.comparePerformance
   );
 };
 

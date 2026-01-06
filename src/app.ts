@@ -18,17 +18,28 @@ const app: FastifyPluginAsync<AppOptions> = async (fastify, opts): Promise<void>
 
   // Log startup
   fastify.log.info(`Starting application in ${config.env} mode`);
+  fastify.log.info(`Routes directory: ${join(__dirname, 'routes')}`);
 
   // Load plugins
-  void fastify.register(AutoLoad, {
+  await fastify.register(AutoLoad, {
     dir: join(__dirname, 'plugins'),
     options: opts,
   });
 
-  // Load routes
-  void fastify.register(AutoLoad, {
-    dir: join(__dirname, 'routes'),
-    options: opts,
+  // Load routes with /api prefix using nested register
+  await fastify.register(async function apiRoutes(api) {
+    await api.register(AutoLoad, {
+      dir: join(__dirname, 'routes'),
+      options: opts,
+      dirNameRoutePrefix: true,
+    });
+  }, { prefix: '/api' });
+
+  // Log all registered routes after server is ready
+  fastify.addHook('onReady', async () => {
+    fastify.log.info('=== Registered Routes ===');
+    const routes = fastify.printRoutes();
+    fastify.log.info(routes);
   });
 };
 

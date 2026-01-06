@@ -34,7 +34,7 @@ WORKDIR /app
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
 
-# Chỉ cài production dependencies
+# Cài production dependencies
 RUN pnpm install --frozen-lockfile --prod
 
 # Copy prisma schema
@@ -49,9 +49,9 @@ COPY --from=builder /app/dist ./dist
 # Expose port
 EXPOSE 3005
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3005/ || exit 1
+# Health check - check /health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD wget -q -O /dev/null http://127.0.0.1:3005/health || exit 1
 
-# Start command - chạy trực tiếp bằng node
-CMD ["node", "dist/app.js"]
+# Start command - sử dụng server.js trực tiếp
+CMD ["node", "dist/server.js"]

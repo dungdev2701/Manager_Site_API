@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { WebsiteRepository } from '../repositories/website.repository';
+import { AuditLogService } from './audit-log.service';
 import { UrlHelper } from '../utils/url';
 import { WebsiteStatus, WebsiteType, Role, Prisma } from '@prisma/client';
 
@@ -13,7 +14,7 @@ export interface WebsiteMetrics {
   // Index
   index?: 'yes' | 'no';
   // About
-  about?: 'no_stacking' | 'stacking_post' | 'stacking_about';
+  about?: 'no_stacking' | 'stacking_post' | 'stacking_about' | 'long_about';
   about_max_chars?: number; // Max characters allowed for about
   // Other fields
   username?: 'unique' | 'duplicate' | 'no'; // Unique: không trùng, Duplicate: được trùng, No: không có username
@@ -64,9 +65,11 @@ export interface BulkCreateResult {
 
 export class WebsiteService {
   private websiteRepository: WebsiteRepository;
+  private auditLogService: AuditLogService;
 
   constructor(private fastify: FastifyInstance) {
     this.websiteRepository = new WebsiteRepository(fastify.prisma);
+    this.auditLogService = new AuditLogService(fastify);
   }
 
   /**
@@ -228,7 +231,7 @@ export class WebsiteService {
 
   /**
    * Lấy danh sách websites với pagination, filtering và sorting
-   * Permission: ALL (ADMIN, MANAGER, CHECKER, VIEWER, CTV)
+   * Permission: ALL (ADMIN, MANAGER, DEV, CTV, CHECKER)
    * Note: CTV chỉ xem được websites do chính họ tạo
    */
   async findAllWebsites(params: {
@@ -334,10 +337,11 @@ export class WebsiteService {
     id: string,
     data: UpdateWebsiteInput,
     userId: string,
-    userRole: Role
+    userRole: Role,
+    requestInfo?: { ipAddress?: string; userAgent?: string }
   ) {
     // Check website exists và kiểm tra quyền (CTV chỉ update được website của mình)
-    await this.getWebsite(id, userId, userRole);
+    const oldWebsite = await this.getWebsite(id, userId, userRole);
 
     // Prepare update data with proper type casting for Prisma
     const updateData: Prisma.WebsiteUpdateInput = {
@@ -349,6 +353,26 @@ export class WebsiteService {
 
     // Update với checkerId tracking
     const updated = await this.websiteRepository.update(id, updateData, userId);
+
+    // Log the change to AuditLog
+    await this.auditLogService.logWebsiteUpdate(
+      id,
+      {
+        type: oldWebsite.type,
+        status: oldWebsite.status,
+        notes: oldWebsite.notes,
+        metrics: oldWebsite.metrics,
+      },
+      {
+        type: updated.type,
+        status: updated.status,
+        notes: updated.notes,
+        metrics: updated.metrics,
+      },
+      userId,
+      requestInfo?.ipAddress,
+      requestInfo?.userAgent
+    );
 
     return updated;
   }
