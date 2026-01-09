@@ -136,6 +136,9 @@ export class WebsiteController {
       captcha_provider: query.captcha_provider,
       required_gmail: query.required_gmail,
       verify: query.verify,
+      // Filter by date range
+      startDate: query.startDate,
+      endDate: query.endDate,
       // User info for role-based filtering
       userId: request.user.id,
       userRole: request.user.role as Role,

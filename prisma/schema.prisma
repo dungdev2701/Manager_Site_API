@@ -40,7 +40,7 @@ enum Role {
 model Website {
   id          String         @id @default(uuid())
   domain      String         @unique
-  type        WebsiteType    @default(ENTITY)
+  types       WebsiteType[]  @default([ENTITY])
   status      WebsiteStatus  @default(NEW)
   notes       String?        @db.Text // Notes from CHECKER (combined note and error details)
 
@@ -71,7 +71,7 @@ model Website {
   stats            WebsiteStats[]
   allocationItems  AllocationItem[]
 
-  @@index([type])
+  @@index([types])
   @@index([status])
   @@index([domain])
   @@index([createdBy])
@@ -96,6 +96,7 @@ enum WebsiteType {
   BLOG2         // Blog 2.0
   PODCAST       // Podcast
   SOCIAL        // Social
+  GG_STACKING   // GG Stacking
 }
 
 enum CheckType {

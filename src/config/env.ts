@@ -33,6 +33,9 @@ const envSchema = z.object({
   // Rate Limiting
   RATE_LIMIT_MAX: z.string().default('100'),
   RATE_LIMIT_TIME_WINDOW: z.string().default('15m'),
+
+  // Public API Key
+  PUBLIC_API_KEY: z.string().min(16, 'PUBLIC_API_KEY must be at least 16 characters'),
 });
 
 type Env = z.infer<typeof envSchema>;
@@ -84,4 +87,6 @@ export const config = {
     max: parseInt(parsedEnv.RATE_LIMIT_MAX, 10),
     timeWindow: parsedEnv.RATE_LIMIT_TIME_WINDOW,
   },
+
+  publicApiKey: parsedEnv.PUBLIC_API_KEY,
 } as const;

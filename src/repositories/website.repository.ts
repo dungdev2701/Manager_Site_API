@@ -72,6 +72,9 @@ export class WebsiteRepository {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // Filter by date range
+    startDate?: string;
+    endDate?: string;
     // Filter by ownership (for CTV)
     createdBy?: string;
   }) {
@@ -88,13 +91,30 @@ export class WebsiteRepository {
       captcha_provider,
       required_gmail,
       verify,
+      startDate,
+      endDate,
       createdBy,
     } = params;
+
+    // Build date range filter
+    let createdAtFilter: { gte?: Date; lte?: Date } | undefined;
+    if (startDate || endDate) {
+      createdAtFilter = {};
+      if (startDate) {
+        createdAtFilter.gte = new Date(startDate);
+      }
+      if (endDate) {
+        // Set to end of day
+        const endOfDay = new Date(endDate);
+        endOfDay.setHours(23, 59, 59, 999);
+        createdAtFilter.lte = endOfDay;
+      }
+    }
 
     // Build where clause with metrics filters
     const where: Prisma.WebsiteWhereInput = {
       deletedAt: null, // Only get active websites (not soft deleted)
-      ...(type && { type }),
+      ...(type && { types: { has: type } }),
       ...(status && { status }),
       ...(search && {
         domain: {
@@ -102,6 +122,8 @@ export class WebsiteRepository {
           mode: 'insensitive' as Prisma.QueryMode,
         },
       }),
+      // Filter by date range
+      ...(createdAtFilter && { createdAt: createdAtFilter }),
       // Filter by ownership (for CTV role)
       ...(createdBy && { createdBy }),
     };
@@ -155,7 +177,7 @@ export class WebsiteRepository {
         select: {
           id: true,
           domain: true,
-          type: true,
+          types: true,
           status: true,
           notes: true,
           metrics: true,
@@ -199,7 +221,7 @@ export class WebsiteRepository {
 
     // Transform websites to include successRate at top level
     let websitesWithStats = websites.map((website) => {
-      const latestStats = website.stats[0];
+      const latestStats = (website as typeof website & { stats: { successRate: number; totalAttempts: number; successCount: number; failureCount: number }[] }).stats[0];
       return {
         ...website,
         successRate: latestStats?.successRate ?? null,
@@ -334,7 +356,7 @@ export class WebsiteRepository {
         select: {
           id: true,
           domain: true,
-          type: true,
+          types: true,
           status: true,
           notes: true,
           metrics: true,
@@ -426,7 +448,7 @@ export class WebsiteRepository {
     // Build where clause with metrics filters
     const where: Prisma.WebsiteWhereInput = {
       deletedAt: null,
-      ...(type && { type }),
+      ...(type && { types: { has: type } }),
       ...(status && { status }),
       ...(search && {
         domain: {
@@ -482,7 +504,7 @@ export class WebsiteRepository {
       select: {
         id: true,
         domain: true,
-        type: true,
+        types: true,
         status: true,
         notes: true,
         metrics: true,

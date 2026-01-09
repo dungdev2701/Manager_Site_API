@@ -105,7 +105,7 @@ export class PerformanceRepository {
         id: true,
         domain: true,
         status: true,
-        type: true,
+        types: true,
         metrics: true,
         createdAt: true,
       },

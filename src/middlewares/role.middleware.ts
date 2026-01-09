@@ -35,8 +35,8 @@ export const canViewWebsites = requireRole(
   Role.CHECKER
 );
 
-// Create: ADMIN, MANAGER, CTV
-export const canCreateWebsites = requireRole(Role.ADMIN, Role.MANAGER, Role.CTV);
+// Create: ADMIN, MANAGER, DEV, CTV
+export const canCreateWebsites = requireRole(Role.ADMIN, Role.MANAGER, Role.DEV, Role.CTV);
 
 // Update: ADMIN, MANAGER, DEV, CHECKER, CTV (CTV chỉ được update website của chính họ - check trong controller)
 export const canUpdateWebsites = requireRole(

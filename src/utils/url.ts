@@ -169,6 +169,47 @@ export class UrlHelper {
   }
 
   /**
+   * Extract domain với path (dành cho GG_STACKING)
+   * Giữ nguyên domain + path, chỉ loại bỏ protocol và trailing slash
+   *
+   * Ví dụ:
+   * - docs.google.com/document → docs.google.com/document
+   * - https://docs.google.com/spreadsheets → docs.google.com/spreadsheets
+   * - drive.google.com/file/d/pdf → drive.google.com/file/d/pdf
+   * - www.google.com/maps → google.com/maps
+   */
+  static extractDomainWithPath(urlString: string): string {
+    try {
+      // Trim
+      urlString = urlString.trim();
+
+      // Thêm protocol nếu thiếu
+      if (!urlString.match(/^https?:\/\//i)) {
+        urlString = 'http://' + urlString;
+      }
+
+      const url = new URL(urlString);
+      let hostname = url.hostname;
+
+      // Loại bỏ www.
+      hostname = hostname.replace(/^www\./i, '');
+
+      // Lấy pathname và loại bỏ trailing slash
+      let pathname = url.pathname;
+      pathname = pathname.replace(/\/+$/, ''); // Remove trailing slashes
+
+      // Kết hợp hostname + pathname
+      const result = pathname && pathname !== '/'
+        ? `${hostname}${pathname}`
+        : hostname;
+
+      return result.toLowerCase();
+    } catch (error) {
+      throw new Error(`Invalid URL: ${urlString}`);
+    }
+  }
+
+  /**
    * Validate URL format
    */
   static isValidUrl(urlString: string): boolean {

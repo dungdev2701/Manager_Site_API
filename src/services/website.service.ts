@@ -10,7 +10,7 @@ export interface WebsiteMetrics {
   // Captcha info
   captcha_type?: 'captcha' | 'normal';
   captcha_provider?: 'recaptcha' | 'hcaptcha'; // Only when captcha_type = 'captcha'
-  cloudflare?: boolean; // Only when captcha_type = 'normal'
+  cloudflare?: boolean; // Can be true for both captcha and normal types
   // Index
   index?: 'yes' | 'no';
   // About
@@ -29,7 +29,7 @@ export interface WebsiteMetrics {
 
 export interface CreateWebsiteInput {
   domain: string;
-  type?: WebsiteType;
+  types?: WebsiteType[];
   notes?: string;
   metrics?: WebsiteMetrics;
 }
@@ -40,7 +40,7 @@ export interface CreateBulkWebsitesInput {
 
 export interface BulkWebsiteItem {
   domain: string;
-  type?: WebsiteType;
+  types?: WebsiteType[];
   metrics?: WebsiteMetrics;
   status?: 'NEW' | 'CHECKING' | 'HANDING' | 'PENDING' | 'RUNNING' | 'ERROR' | 'MAINTENANCE';
 }
@@ -50,7 +50,7 @@ export interface CreateBulkWebsitesWithMetricsInput {
 }
 
 export interface UpdateWebsiteInput {
-  type?: WebsiteType;
+  types?: WebsiteType[];
   status?: WebsiteStatus;
   notes?: string;
   metrics?: WebsiteMetrics;
@@ -74,11 +74,22 @@ export class WebsiteService {
 
   /**
    * Tạo 1 website
-   * Permission: ADMIN, MANAGER
+   * Permission: ADMIN, MANAGER, DEV
+   *
+   * Note: Với GG_STACKING, PODCAST type, giữ nguyên domain + path
+   * Ví dụ: docs.google.com/document, drive.google.com/file/d/pdf
    */
   async createWebsite(input: CreateWebsiteInput, createdBy?: string) {
-    // Extract và normalize domain
-    const domain = UrlHelper.extractDomain(input.domain);
+    // Xác định types
+    const types = input.types || [WebsiteType.ENTITY];
+
+    // Extract domain dựa vào type
+    // GG_STACKING, PODCAST: giữ nguyên path (docs.google.com/document)
+    // Các type khác: chỉ lấy domain chính
+    const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
+    const domain = shouldKeepPath
+      ? UrlHelper.extractDomainWithPath(input.domain)
+      : UrlHelper.extractDomain(input.domain);
 
     // Check domain đã tồn tại chưa
     const existingWebsite = await this.websiteRepository.findByDomain(domain);
@@ -91,7 +102,7 @@ export class WebsiteService {
     // Tạo website mới
     const website = await this.websiteRepository.create({
       domain,
-      type: input.type || WebsiteType.ENTITY,
+      types,
       status: WebsiteStatus.NEW,
       ...(input.notes && { notes: input.notes }),
       ...(input.metrics && { metrics: input.metrics as Prisma.InputJsonValue }),
@@ -160,24 +171,33 @@ export class WebsiteService {
    * Tạo nhiều websites với metrics đầy đủ (bulk import từ Excel)
    * Permission: ADMIN, MANAGER
    *
-   * Note: Sử dụng extractDomainKeepSubdomain để giữ nguyên subdomain
-   * Ví dụ: academy.worldrowing.com, 3dwarehouse.sketchup.com sẽ được giữ nguyên
+   * Note:
+   * - GG_STACKING, PODCAST: giữ nguyên domain + path (docs.google.com/document)
+   * - Các type khác: giữ subdomain nhưng bỏ path (academy.worldrowing.com)
    */
   async createBulkWebsitesWithMetrics(
     input: CreateBulkWebsitesWithMetricsInput,
     createdBy?: string
   ): Promise<BulkCreateResult> {
     const invalid: string[] = [];
-    const validWebsites: { domain: string; type?: WebsiteType; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
+    const validWebsites: { domain: string; types?: WebsiteType[]; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
 
-    // 1. Extract và validate domains (giữ nguyên subdomain)
+    // 1. Extract và validate domains
     for (const item of input.websites) {
       try {
-        const domain = UrlHelper.extractDomainKeepSubdomain(item.domain);
+        const types = item.types || [WebsiteType.ENTITY];
+        const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
+
+        // GG_STACKING, PODCAST: giữ nguyên path
+        // Các type khác: chỉ giữ subdomain, bỏ path
+        const domain = shouldKeepPath
+          ? UrlHelper.extractDomainWithPath(item.domain)
+          : UrlHelper.extractDomainKeepSubdomain(item.domain);
+
         if (domain) {
           validWebsites.push({
             domain,
-            type: item.type,
+            types,
             metrics: item.metrics,
             status: item.status ? (item.status as WebsiteStatus) : WebsiteStatus.NEW,
           });
@@ -211,7 +231,7 @@ export class WebsiteService {
     if (newWebsites.length > 0) {
       const createData = newWebsites.map((website) => ({
         domain: website.domain,
-        type: website.type || WebsiteType.ENTITY,
+        types: website.types || [WebsiteType.ENTITY],
         status: website.status || WebsiteStatus.NEW,
         ...(website.metrics && { metrics: website.metrics as Prisma.InputJsonValue }),
         ...(createdBy && { createdBy }),
@@ -249,6 +269,9 @@ export class WebsiteService {
     captcha_provider?: 'recaptcha' | 'hcaptcha';
     required_gmail?: 'yes' | 'no';
     verify?: 'yes' | 'no';
+    // Filter by date range
+    startDate?: string;
+    endDate?: string;
     // User info for role-based filtering
     userId?: string;
     userRole?: Role;
@@ -266,6 +289,8 @@ export class WebsiteService {
       captcha_provider,
       required_gmail,
       verify,
+      startDate,
+      endDate,
       userId,
       userRole,
     } = params;
@@ -288,6 +313,8 @@ export class WebsiteService {
       captcha_provider,
       required_gmail,
       verify,
+      startDate,
+      endDate,
       createdBy,
     });
 
@@ -345,7 +372,7 @@ export class WebsiteService {
 
     // Prepare update data with proper type casting for Prisma
     const updateData: Prisma.WebsiteUpdateInput = {
-      ...(data.type && { type: data.type }),
+      ...(data.types && { types: data.types }),
       ...(data.status && { status: data.status }),
       ...(data.notes !== undefined && { notes: data.notes }),
       ...(data.metrics && { metrics: data.metrics as Prisma.InputJsonValue }),
@@ -358,13 +385,13 @@ export class WebsiteService {
     await this.auditLogService.logWebsiteUpdate(
       id,
       {
-        type: oldWebsite.type,
+        types: oldWebsite.types,
         status: oldWebsite.status,
         notes: oldWebsite.notes,
         metrics: oldWebsite.metrics,
       },
       {
-        type: updated.type,
+        types: updated.types,
         status: updated.status,
         notes: updated.notes,
         metrics: updated.metrics,

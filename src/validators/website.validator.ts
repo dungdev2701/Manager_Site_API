@@ -3,7 +3,7 @@ import { z } from 'zod';
 /**
  * Enum cho loại website
  */
-export const websiteTypeEnum = z.enum(['ENTITY', 'BLOG2', 'PODCAST', 'SOCIAL']);
+export const websiteTypeEnum = z.enum(['ENTITY', 'BLOG2', 'PODCAST', 'SOCIAL', 'GG_STACKING']);
 
 /**
  * Schema cho metrics của website
@@ -55,7 +55,7 @@ export const createWebsiteSchema = z.object({
       },
       { message: 'Invalid domain format. Examples: abc.com, blog.shinobi.jp, https://example.com' }
     ),
-  type: websiteTypeEnum.optional(), // Default ENTITY in database
+  types: z.array(websiteTypeEnum).optional(), // Default [ENTITY] in database
   notes: z.string().max(5000).optional(),
   metrics: websiteMetricsSchema,
 });
@@ -65,7 +65,7 @@ export const createWebsiteSchema = z.object({
  */
 export const bulkWebsiteItemSchema = z.object({
   domain: z.string().min(1),
-  type: websiteTypeEnum.optional(), // Default ENTITY in database
+  types: z.array(websiteTypeEnum).optional(), // Default [ENTITY] in database
   metrics: websiteMetricsSchema,
   status: z
     .enum(['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'])
@@ -96,7 +96,7 @@ export const createBulkWebsitesWithMetricsSchema = z.object({
  * Schema cho việc update website
  */
 export const updateWebsiteSchema = z.object({
-  type: websiteTypeEnum.optional(),
+  types: z.array(websiteTypeEnum).optional(),
   status: z
     .enum(['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'])
     .optional(),
@@ -132,6 +132,9 @@ export const websiteQuerySchema = z.object({
   captcha_provider: z.enum(['recaptcha', 'hcaptcha']).optional(),
   required_gmail: z.enum(['yes', 'no']).optional(),
   verify: z.enum(['yes', 'no']).optional(),
+  // Filter by date range
+  startDate: z.string().optional(), // Format: YYYY-MM-DD
+  endDate: z.string().optional(), // Format: YYYY-MM-DD
 });
 
 // Export types

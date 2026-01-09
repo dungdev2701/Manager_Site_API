@@ -11,6 +11,14 @@ const STATUS_CHECK_INTERVAL = 15 * 1000; // Check status every 15 seconds
 const REALLOCATION_INTERVAL = 20 * 1000; // Check reallocation every 20 seconds
 
 const allocationJobPlugin: FastifyPluginAsync = async (fastify) => {
+  // Skip if allocation job is disabled via environment variable
+  // Set ALLOCATION_JOB_ENABLED=false to disable
+  const isEnabled = process.env.ALLOCATION_JOB_ENABLED !== 'false';
+  if (!isEnabled) {
+    fastify.log.warn('⚠️ Allocation job disabled via ALLOCATION_JOB_ENABLED=false');
+    return;
+  }
+
   // Skip if MySQL is not configured
   if (!fastify.mysql) {
     fastify.log.warn('⚠️ MySQL not configured, allocation job disabled');

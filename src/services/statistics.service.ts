@@ -18,12 +18,18 @@ export class StatisticsService {
       _count: { status: true },
     });
 
-    // Get type counts
-    const typeCounts = await prisma.website.groupBy({
-      by: ['type'],
+    // Get type counts (since types is array, we count occurrences of each type)
+    const allWebsites = await prisma.website.findMany({
       where: { deletedAt: null },
-      _count: { type: true },
+      select: { types: true },
     });
+    const typeCountMap: Record<string, number> = {};
+    for (const w of allWebsites) {
+      for (const t of w.types) {
+        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
+      }
+    }
+    const typeCounts = Object.entries(typeCountMap).map(([type, count]) => ({ type, count }));
 
     // Get total users
     const totalUsers = await prisma.user.count({
@@ -80,10 +86,7 @@ export class StatisticsService {
         status: s.status,
         count: s._count.status,
       })),
-      typeCounts: typeCounts.map((t) => ({
-        type: t.type,
-        count: t._count.type,
-      })),
+      typeCounts,
       allocationStats: {
         totalAllocations,
         totalSuccess,
@@ -115,18 +118,25 @@ export class StatisticsService {
   async getByType() {
     const prisma = this.fastify.prisma;
 
-    const stats = await prisma.website.groupBy({
-      by: ['type'],
+    // Since types is an array, count occurrences of each type
+    const allWebsites = await prisma.website.findMany({
       where: { deletedAt: null },
-      _count: { type: true },
+      select: { types: true },
     });
 
-    const total = stats.reduce((sum, s) => sum + s._count.type, 0);
+    const typeCountMap: Record<string, number> = {};
+    for (const w of allWebsites) {
+      for (const t of w.types) {
+        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
+      }
+    }
 
-    return stats.map((s) => ({
-      type: s.type,
-      count: s._count.type,
-      percentage: total > 0 ? Math.round((s._count.type / total) * 100 * 100) / 100 : 0,
+    const total = Object.values(typeCountMap).reduce((sum, count) => sum + count, 0);
+
+    return Object.entries(typeCountMap).map(([type, count]) => ({
+      type,
+      count,
+      percentage: total > 0 ? Math.round((count / total) * 100 * 100) / 100 : 0,
     }));
   }
 
@@ -241,7 +251,7 @@ export class StatisticsService {
         id: true,
         domain: true,
         status: true,
-        type: true,
+        types: true,
       },
     });
 
@@ -263,7 +273,7 @@ export class StatisticsService {
           websiteId: ws.websiteId,
           domain: website.domain,
           status: website.status,
-          type: website.type,
+          types: website.types,
           allocations,
           success,
           failure,
@@ -596,15 +606,21 @@ export class StatisticsService {
       _count: { status: true },
     });
 
-    // Get type counts for websites added by this CTV
-    const typeCounts = await prisma.website.groupBy({
-      by: ['type'],
+    // Get type counts for websites added by this CTV (types is array)
+    const ctvWebsites = await prisma.website.findMany({
       where: {
         deletedAt: null,
         createdBy: userId,
       },
-      _count: { type: true },
+      select: { types: true },
     });
+    const ctvTypeCountMap: Record<string, number> = {};
+    for (const w of ctvWebsites) {
+      for (const t of w.types) {
+        ctvTypeCountMap[t] = (ctvTypeCountMap[t] || 0) + 1;
+      }
+    }
+    const typeCounts = Object.entries(ctvTypeCountMap).map(([type, count]) => ({ type, count }));
 
     // Get websites added this week by CTV
     const oneWeekAgo = new Date();
@@ -635,10 +651,7 @@ export class StatisticsService {
         status: s.status,
         count: (s._count as { status: number })?.status ?? 0,
       })),
-      typeCounts: typeCounts.map((t) => ({
-        type: t.type,
-        count: (t._count as { type: number })?.type ?? 0,
-      })),
+      typeCounts,
     };
   }
 
@@ -669,25 +682,29 @@ export class StatisticsService {
   async getCTVByType(userId: string) {
     const prisma = this.fastify.prisma;
 
-    const stats = await prisma.website.groupBy({
-      by: ['type'],
+    // Since types is an array, count occurrences of each type
+    const websites = await prisma.website.findMany({
       where: {
         deletedAt: null,
         createdBy: userId,
       },
-      _count: { type: true },
+      select: { types: true },
     });
 
-    const total = stats.reduce((sum, s) => sum + ((s._count as { type: number })?.type ?? 0), 0);
+    const typeCountMap: Record<string, number> = {};
+    for (const w of websites) {
+      for (const t of w.types) {
+        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
+      }
+    }
 
-    return stats.map((s) => {
-      const count = (s._count as { type: number })?.type ?? 0;
-      return {
-        type: s.type,
-        count,
-        percentage: total > 0 ? Math.round((count / total) * 100 * 100) / 100 : 0,
-      };
-    });
+    const total = Object.values(typeCountMap).reduce((sum, count) => sum + count, 0);
+
+    return Object.entries(typeCountMap).map(([type, count]) => ({
+      type,
+      count,
+      percentage: total > 0 ? Math.round((count / total) * 100 * 100) / 100 : 0,
+    }));
   }
 
   async getCTVDailyTrends(userId: string, startDate: Date, endDate: Date) {
@@ -1412,7 +1429,7 @@ export class StatisticsService {
         id: true,
         domain: true,
         status: true,
-        type: true,
+        types: true,
       },
     });
 
@@ -1435,7 +1452,7 @@ export class StatisticsService {
           websiteId: ws.websiteId,
           domain: website.domain,
           status: website.status,
-          type: website.type,
+          types: website.types,
           allocations,
           success,
           failure,

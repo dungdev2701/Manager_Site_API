@@ -37,7 +37,7 @@ export interface PerformanceResponse {
     id: string;
     domain: string;
     status: string;
-    type: string;
+    types: string[];
   };
   period: {
     startDate: string;
@@ -157,7 +157,7 @@ export class PerformanceService {
         id: website.id,
         domain: website.domain,
         status: website.status,
-        type: website.type,
+        types: website.types,
       },
       period: {
         startDate: startDate.toISOString().split('T')[0],
