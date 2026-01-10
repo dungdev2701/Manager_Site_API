@@ -30,6 +30,41 @@ export class UrlHelper {
   ];
 
   /**
+   * Danh sách country-code second-level domains (ccSLD)
+   * Các TLD này có 2 phần: .co.jp, .com.au, .co.uk, etc.
+   * Khi extract domain, cần lấy 3 parts thay vì 2
+   */
+  private static readonly MULTI_LEVEL_TLDS = [
+    // Japan
+    'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'ad.jp', 'ed.jp', 'go.jp', 'gr.jp', 'lg.jp',
+    // UK
+    'co.uk', 'org.uk', 'me.uk', 'ac.uk', 'gov.uk', 'net.uk', 'sch.uk',
+    // Australia
+    'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'asn.au', 'id.au',
+    // New Zealand
+    'co.nz', 'net.nz', 'org.nz', 'govt.nz', 'ac.nz', 'school.nz',
+    // Brazil
+    'com.br', 'net.br', 'org.br', 'gov.br', 'edu.br',
+    // India
+    'co.in', 'net.in', 'org.in', 'gen.in', 'firm.in', 'ind.in',
+    // South Korea
+    'co.kr', 'ne.kr', 'or.kr', 'go.kr', 'ac.kr', 're.kr',
+    // China
+    'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn', 'ac.cn',
+    // Taiwan
+    'com.tw', 'net.tw', 'org.tw', 'gov.tw', 'edu.tw',
+    // Hong Kong
+    'com.hk', 'net.hk', 'org.hk', 'gov.hk', 'edu.hk',
+    // Singapore
+    'com.sg', 'net.sg', 'org.sg', 'gov.sg', 'edu.sg',
+    // South Africa
+    'co.za', 'net.za', 'org.za', 'gov.za', 'ac.za',
+    // Other common ones
+    'com.mx', 'com.ar', 'com.co', 'com.ve', 'com.pe', 'com.ec',
+    'co.id', 'co.th', 'co.il', 'co.ke',
+  ];
+
+  /**
    * Extract domain từ URL đầy đủ hoặc domain
    *
    * Ví dụ:
@@ -61,17 +96,20 @@ export class UrlHelper {
   }
 
   /**
-   * Extract root domain, xử lý public suffixes
+   * Extract root domain, xử lý public suffixes và multi-level TLDs
    *
    * Logic:
    * 1. Check nếu hostname khớp với known public suffix
    *    → Return public suffix (vd: blog.shinobi.jp)
-   * 2. Nếu không khớp → Extract domain chính (last 2 parts)
+   * 2. Check nếu hostname có multi-level TLD (.co.jp, .com.au)
+   *    → Return domain + TLD (vd: rakuten.co.jp)
+   * 3. Nếu không khớp → Extract domain chính (last 2 parts)
    *    → Return domain.tld (vd: example.com)
    *
    * Examples:
    * - dungtest.blog.shinobi.jp → blog.shinobi.jp
    * - abc.blog.fc2.com → blog.fc2.com
+   * - plaza.rakuten.co.jp → rakuten.co.jp
    * - subdomain.example.com → example.com
    * - example.com → example.com
    */
@@ -98,7 +136,19 @@ export class UrlHelper {
       return hostname;
     }
 
-    // Lấy 2 parts cuối (domain.tld)
+    // Check nếu hostname có multi-level TLD (.co.jp, .com.au, etc.)
+    // Cần lấy 3 parts thay vì 2
+    const lastTwoParts = parts.slice(-2).join('.');
+    if (this.MULTI_LEVEL_TLDS.includes(lastTwoParts)) {
+      // Multi-level TLD → lấy 3 parts cuối
+      // vd: plaza.rakuten.co.jp → rakuten.co.jp
+      if (parts.length >= 3) {
+        return parts.slice(-3).join('.');
+      }
+      return hostname;
+    }
+
+    // Standard TLD → lấy 2 parts cuối
     // vd: sub.example.com → example.com
     return parts.slice(-2).join('.');
   }

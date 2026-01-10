@@ -231,33 +231,38 @@ export class ReallocationService {
       },
     });
 
-    // Tạo allocation items và update daily allocation
-    for (const website of allWebsites) {
-      await this.prisma.allocationItem.create({
-        data: {
-          batchId: batch.id,
-          websiteId: website.id,
-          domain: website.domain,
-          trafficType: website.trafficType,
-          status: AllocationItemStatus.PENDING,
-        },
-      });
+    // OPTIMIZED: Tạo allocation items batch + update daily allocation song song
+    // Thay vì N*2 queries tuần tự, giờ là 2 queries song song
 
-      // Update daily allocation count
-      await this.prisma.dailyAllocation.upsert({
-        where: {
-          websiteId_date: { websiteId: website.id, date: today },
-        },
-        create: {
-          websiteId: website.id,
-          date: today,
-          allocationCount: 1,
-        },
-        update: {
-          allocationCount: { increment: 1 },
-        },
-      });
-    }
+    // Batch create allocation items
+    await this.prisma.allocationItem.createMany({
+      data: allWebsites.map((website) => ({
+        batchId: batch.id,
+        websiteId: website.id,
+        domain: website.domain,
+        trafficType: website.trafficType,
+        status: AllocationItemStatus.PENDING,
+      })),
+    });
+
+    // Batch upsert daily allocations song song
+    await Promise.all(
+      allWebsites.map((website) =>
+        this.prisma.dailyAllocation.upsert({
+          where: {
+            websiteId_date: { websiteId: website.id, date: today },
+          },
+          create: {
+            websiteId: website.id,
+            date: today,
+            allocationCount: 1,
+          },
+          update: {
+            allocationCount: { increment: 1 },
+          },
+        })
+      )
+    );
 
     // Insert vào MySQL entity_link
     const links = allWebsites.map((w) => ({

@@ -80,6 +80,7 @@ export const createBulkWebsitesSchema = z.object({
     .array(z.string().min(1))
     .min(1, 'At least one domain is required')
     .max(1000, 'Maximum 1000 domains allowed'),
+  types: z.array(websiteTypeEnum).optional(), // Default [ENTITY] in service
 });
 
 /**

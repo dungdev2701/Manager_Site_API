@@ -36,6 +36,7 @@ export interface CreateWebsiteInput {
 
 export interface CreateBulkWebsitesInput {
   domains: string[];
+  types?: WebsiteType[];
 }
 
 export interface BulkWebsiteItem {
@@ -85,11 +86,11 @@ export class WebsiteService {
 
     // Extract domain dựa vào type
     // GG_STACKING, PODCAST: giữ nguyên path (docs.google.com/document)
-    // Các type khác: chỉ lấy domain chính
+    // Các type khác: giữ subdomain, chỉ cắt www. và path
     const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
     const domain = shouldKeepPath
       ? UrlHelper.extractDomainWithPath(input.domain)
-      : UrlHelper.extractDomain(input.domain);
+      : UrlHelper.extractDomainKeepSubdomain(input.domain);
 
     // Check domain đã tồn tại chưa
     const existingWebsite = await this.websiteRepository.findByDomain(domain);
@@ -125,13 +126,37 @@ export class WebsiteService {
    * - Loại bỏ duplicates trong input bằng Set (O(n))
    * - 1 query để check existing domains (IN clause)
    * - 1 bulk insert thay vì N separate inserts
+   *
+   * Note: Nếu types include GG_STACKING hoặc PODCAST, giữ nguyên path
    */
   async createBulkWebsites(
     input: CreateBulkWebsitesInput,
     createdBy?: string
   ): Promise<BulkCreateResult> {
+    // Đảm bảo types là WebsiteType[] enum, không phải string[]
+    const types: WebsiteType[] = input.types && input.types.length > 0
+      ? input.types.map(t => t as WebsiteType)
+      : [WebsiteType.ENTITY];
+    const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
+
     // 1. Extract unique domains (in-memory operation)
-    const { domains, invalid } = UrlHelper.extractUniqueDomains(input.domains);
+    // GG_STACKING, PODCAST: giữ nguyên path (docs.google.com/document)
+    // Các type khác: giữ subdomain, chỉ cắt www. và path
+    const domainsSet = new Set<string>();
+    const invalid: string[] = [];
+
+    for (const url of input.domains) {
+      try {
+        const domain = shouldKeepPath
+          ? UrlHelper.extractDomainWithPath(url)
+          : UrlHelper.extractDomainKeepSubdomain(url);
+        domainsSet.add(domain);
+      } catch {
+        invalid.push(url);
+      }
+    }
+
+    const domains = Array.from(domainsSet);
 
     if (domains.length === 0) {
       throw this.fastify.httpErrors.badRequest('No valid domains provided');
@@ -151,6 +176,7 @@ export class WebsiteService {
     if (newDomains.length > 0) {
       const createData = newDomains.map((domain) => ({
         domain,
+        types,
         status: WebsiteStatus.NEW,
         ...(createdBy && { createdBy }),
       }));

@@ -12,33 +12,42 @@ export class WebsiteRepository {
 
   /**
    * Tạo nhiều websites cùng lúc (bulk insert)
-   * OPTIMIZATION: Sử dụng createMany thay vì multiple create() → 1 DB query thay vì N queries
+   *
+   * NOTE: Prisma createMany KHÔNG hỗ trợ array fields (như types: WebsiteType[])
+   * trên PostgreSQL - nó sẽ bỏ qua array và dùng default value từ schema.
+   * Giải pháp: Sử dụng transaction với nhiều create() để hỗ trợ array fields đúng cách.
    */
   async createMany(data: Prisma.WebsiteCreateManyInput[]): Promise<number> {
-    const result = await this.prisma.website.createMany({
-      data,
-      skipDuplicates: true, // Bỏ qua nếu domain đã tồn tại (unique constraint)
-    });
-    return result.count; // Số lượng records được tạo
+    // Sử dụng transaction để tạo nhiều records với array fields
+    const results = await this.prisma.$transaction(
+      data.map((item) =>
+        this.prisma.website.create({
+          data: item as Prisma.WebsiteCreateInput,
+          select: { id: true },
+        })
+      )
+    );
+    return results.length;
   }
 
   /**
-   * Tìm website theo domain
+   * Tìm website theo domain (chỉ tìm trong các website chưa bị xóa mềm)
    */
   async findByDomain(domain: string): Promise<Website | null> {
-    return this.prisma.website.findUnique({
-      where: { domain },
+    return this.prisma.website.findFirst({
+      where: { domain, deletedAt: null },
     });
   }
 
   /**
-   * Tìm nhiều websites theo domains
+   * Tìm nhiều websites theo domains (chỉ tìm trong các website chưa bị xóa mềm)
    * OPTIMIZATION: 1 query với IN clause thay vì N queries
    */
   async findManyByDomains(domains: string[]) {
     return this.prisma.website.findMany({
       where: {
         domain: { in: domains },
+        deletedAt: null,
       },
       select: {
         id: true,
@@ -167,12 +176,16 @@ export class WebsiteRepository {
     // because Prisma doesn't support direct JSONB field ordering
     const needsJsonSort = effectiveSortBy === 'traffic' || effectiveSortBy === 'DA';
 
+    // OPTIMIZATION: Giới hạn số lượng records khi sort theo JSONB để tránh memory issues
+    // Khi sort theo JSONB, chỉ load tối đa 5000 records (đủ cho hầu hết use cases)
+    const MAX_JSONB_SORT_LIMIT = 5000;
+
     // OPTIMIZATION: Chạy 2 queries song song thay vì tuần tự
     const [websites, total] = await Promise.all([
       this.prisma.website.findMany({
         where,
         skip: needsJsonSort ? undefined : skip, // Fetch all if we need to sort by JSON field
-        take: needsJsonSort ? undefined : take,
+        take: needsJsonSort ? MAX_JSONB_SORT_LIMIT : take, // Giới hạn khi sort JSONB
         orderBy,
         select: {
           id: true,

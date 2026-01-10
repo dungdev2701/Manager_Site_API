@@ -4,11 +4,13 @@ import { AllocationService } from '../services/allocation.service';
 import { RequestStatusCheckerService } from '../services/request-status-checker.service';
 import { ReallocationService } from '../services/reallocation.service';
 
-// Interval in milliseconds - optimized for real-time middleware
-const PROCESS_INTERVAL = 10 * 1000; // Process every 10 seconds
-const SYNC_INTERVAL = 30 * 1000; // Sync every 30 seconds
-const STATUS_CHECK_INTERVAL = 15 * 1000; // Check status every 15 seconds
-const REALLOCATION_INTERVAL = 20 * 1000; // Check reallocation every 20 seconds
+// Interval in milliseconds - OPTIMIZED để giảm CPU usage
+// Tăng interval để giảm số lượng queries đến DB
+// Trước: 10s, 15s, 20s, 30s -> Sau: 30s, 45s, 60s, 90s
+const PROCESS_INTERVAL = 30 * 1000; // Process every 30 seconds (was 10s)
+const SYNC_INTERVAL = 90 * 1000; // Sync every 90 seconds (was 30s)
+const STATUS_CHECK_INTERVAL = 45 * 1000; // Check status every 45 seconds (was 15s)
+const REALLOCATION_INTERVAL = 60 * 1000; // Check reallocation every 60 seconds (was 20s)
 
 const allocationJobPlugin: FastifyPluginAsync = async (fastify) => {
   // Skip if allocation job is disabled via environment variable

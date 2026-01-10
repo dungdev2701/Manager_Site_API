@@ -348,27 +348,33 @@ export class AllocationService {
 
   /**
    * Update daily allocation counts
+   * OPTIMIZED: Sử dụng Promise.all để chạy song song thay vì tuần tự
+   * Giảm thời gian từ N * latency xuống còn ~1 * latency
    */
   async updateDailyAllocations(
     websiteIds: string[],
     date: Date
   ): Promise<void> {
-    // Upsert daily allocations
-    for (const websiteId of websiteIds) {
-      await this.prisma.dailyAllocation.upsert({
-        where: {
-          websiteId_date: { websiteId, date },
-        },
-        create: {
-          websiteId,
-          date,
-          allocationCount: 1,
-        },
-        update: {
-          allocationCount: { increment: 1 },
-        },
-      });
-    }
+    if (websiteIds.length === 0) return;
+
+    // Batch upsert với Promise.all - chạy song song
+    await Promise.all(
+      websiteIds.map((websiteId) =>
+        this.prisma.dailyAllocation.upsert({
+          where: {
+            websiteId_date: { websiteId, date },
+          },
+          create: {
+            websiteId,
+            date,
+            allocationCount: 1,
+          },
+          update: {
+            allocationCount: { increment: 1 },
+          },
+        })
+      )
+    );
   }
 
   // ==================== RESULT SYNC ====================
@@ -386,6 +392,7 @@ export class AllocationService {
    * - 1 query lấy tất cả batches từ PostgreSQL
    * - 1 query lấy tất cả requests từ MySQL (thay vì N queries)
    * - 1 query lấy tất cả entity_links từ MySQL (thay vì N queries)
+   * - Chỉ sync batches trong 7 ngày gần nhất (tránh query historical data)
    */
   async syncCompletedRequests(): Promise<{
     syncedRequests: number;
@@ -394,11 +401,15 @@ export class AllocationService {
     let syncedRequests = 0;
     const websitesToUpdate = new Set<string>();
 
-    // Get all COMPLETED batches to check for status changes
-    // Không chỉ lấy batches có items chưa sync, mà lấy tất cả để detect status changes
+    // Chỉ sync batches trong 7 ngày gần nhất để tránh query quá nhiều data
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+    // Get COMPLETED batches trong 7 ngày gần nhất
     const batches = await this.prisma.allocationBatch.findMany({
       where: {
         status: AllocationBatchStatus.COMPLETED,
+        completedAt: { gte: sevenDaysAgo },
       },
       include: {
         items: true,
@@ -573,77 +584,110 @@ export class AllocationService {
   /**
    * Update WebsiteStats with calculated success rates
    * Called after syncing results from completed requests
+   *
+   * OPTIMIZED: Sử dụng aggregate queries thay vì N+1 queries
+   * - 1 query aggregate để lấy counts cho TẤT CẢ websites
+   * - 1 query để lấy existing stats
+   * - Batch upsert với Promise.all
    */
   async updateWebsiteStats(websiteIds: string[]): Promise<void> {
+    if (websiteIds.length === 0) return;
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
     const periodStart = new Date(today);
     periodStart.setDate(periodStart.getDate() - 30); // Last 30 days
 
-    for (const websiteId of websiteIds) {
-      // Get all allocation items for this website in the period
-      const items = await this.prisma.allocationItem.findMany({
-        where: {
-          websiteId,
-          allocatedAt: { gte: periodStart },
-          status: {
-            in: [AllocationItemStatus.SUCCESS, AllocationItemStatus.FAILED],
-          },
+    // BATCH QUERY 1: Aggregate counts cho TẤT CẢ websites trong 1 query
+    const statsAggregates = await this.prisma.allocationItem.groupBy({
+      by: ['websiteId', 'status'],
+      where: {
+        websiteId: { in: websiteIds },
+        allocatedAt: { gte: periodStart },
+        status: {
+          in: [AllocationItemStatus.SUCCESS, AllocationItemStatus.FAILED],
         },
-      });
+      },
+      _count: {
+        _all: true,
+      },
+    });
 
-      if (items.length === 0) continue;
+    // Build map: websiteId -> { successCount, failureCount }
+    const statsMap = new Map<string, { successCount: number; failureCount: number }>();
+    for (const agg of statsAggregates) {
+      const existing = statsMap.get(agg.websiteId) || { successCount: 0, failureCount: 0 };
+      if (agg.status === AllocationItemStatus.SUCCESS) {
+        existing.successCount = agg._count._all;
+      } else if (agg.status === AllocationItemStatus.FAILED) {
+        existing.failureCount = agg._count._all;
+      }
+      statsMap.set(agg.websiteId, existing);
+    }
 
-      const successCount = items.filter(
-        (i: { status: AllocationItemStatus }) => i.status === AllocationItemStatus.SUCCESS
-      ).length;
-      const failureCount = items.filter(
-        (i: { status: AllocationItemStatus }) => i.status === AllocationItemStatus.FAILED
-      ).length;
+    // Skip nếu không có data
+    if (statsMap.size === 0) return;
+
+    // BATCH QUERY 2: Lấy existing stats cho tất cả websites
+    const existingStatsList = await this.prisma.websiteStats.findMany({
+      where: {
+        websiteId: { in: Array.from(statsMap.keys()) },
+        userId: null,
+        periodType: 'MONTHLY',
+        periodStart,
+      },
+    });
+    const existingStatsMap = new Map(
+      existingStatsList.map((s) => [s.websiteId, s])
+    );
+
+    // BATCH UPSERT: Update/Create stats song song
+    const upsertPromises: Promise<unknown>[] = [];
+
+    for (const [websiteId, counts] of statsMap) {
+      const { successCount, failureCount } = counts;
       const totalAttempts = successCount + failureCount;
       const successRate = totalAttempts > 0 ? (successCount / totalAttempts) * 100 : 0;
 
-      // Find or create WebsiteStats for MONTHLY period (system-level, userId = null)
-      const existingStats = await this.prisma.websiteStats.findFirst({
-        where: {
-          websiteId,
-          userId: null,
-          periodType: 'MONTHLY',
-          periodStart,
-        },
-      });
+      const existing = existingStatsMap.get(websiteId);
 
-      if (existingStats) {
-        await this.prisma.websiteStats.update({
-          where: { id: existingStats.id },
-          data: {
-            periodEnd: today,
-            totalAttempts,
-            successCount,
-            failureCount,
-            successRate,
-          },
-        });
+      if (existing) {
+        upsertPromises.push(
+          this.prisma.websiteStats.update({
+            where: { id: existing.id },
+            data: {
+              periodEnd: today,
+              totalAttempts,
+              successCount,
+              failureCount,
+              successRate,
+            },
+          })
+        );
       } else {
-        await this.prisma.websiteStats.create({
-          data: {
-            websiteId,
-            periodType: 'MONTHLY',
-            periodStart,
-            periodEnd: today,
-            totalAttempts,
-            successCount,
-            failureCount,
-            successRate,
-          },
-        });
+        upsertPromises.push(
+          this.prisma.websiteStats.create({
+            data: {
+              websiteId,
+              periodType: 'MONTHLY',
+              periodStart,
+              periodEnd: today,
+              totalAttempts,
+              successCount,
+              failureCount,
+              successRate,
+            },
+          })
+        );
       }
-
-      this.fastify.log.debug(
-        `Updated stats for website ${websiteId}: ${successRate.toFixed(2)}% success rate (${successCount}/${totalAttempts})`
-      );
     }
+
+    await Promise.all(upsertPromises);
+
+    this.fastify.log.debug(
+      `Updated stats for ${statsMap.size} websites`
+    );
   }
 
   /**

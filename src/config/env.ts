@@ -34,8 +34,15 @@ const envSchema = z.object({
   RATE_LIMIT_MAX: z.string().default('100'),
   RATE_LIMIT_TIME_WINDOW: z.string().default('15m'),
 
-  // Public API Key
+  // Public API Key (legacy - kept for backward compatibility)
   PUBLIC_API_KEY: z.string().min(16, 'PUBLIC_API_KEY must be at least 16 characters'),
+
+  // API Keys per WebsiteType (sent via x-api-key header)
+  API_KEY_ENTITY: z.string().min(16).optional(),
+  API_KEY_BLOG2: z.string().min(16).optional(),
+  API_KEY_PODCAST: z.string().min(16).optional(),
+  API_KEY_SOCIAL: z.string().min(16).optional(),
+  API_KEY_GG_STACKING: z.string().min(16).optional(),
 });
 
 type Env = z.infer<typeof envSchema>;
@@ -88,5 +95,15 @@ export const config = {
     timeWindow: parsedEnv.RATE_LIMIT_TIME_WINDOW,
   },
 
+  // Legacy public API key (backward compatibility)
   publicApiKey: parsedEnv.PUBLIC_API_KEY,
+
+  // API Keys per WebsiteType - map từ API key -> allowed types
+  apiKeys: {
+    ENTITY: parsedEnv.API_KEY_ENTITY,
+    BLOG2: parsedEnv.API_KEY_BLOG2,
+    PODCAST: parsedEnv.API_KEY_PODCAST,
+    SOCIAL: parsedEnv.API_KEY_SOCIAL,
+    GG_STACKING: parsedEnv.API_KEY_GG_STACKING,
+  },
 } as const;

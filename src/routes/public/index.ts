@@ -1,10 +1,6 @@
 import { FastifyPluginAsync } from 'fastify';
 import { apiKeyMiddleware } from '../../middlewares/apikey.middleware';
-import { WebsiteStatus, WebsiteType } from '@prisma/client';
-
-// Valid values for validation
-const VALID_TYPES = Object.values(WebsiteType);
-const VALID_STATUSES = Object.values(WebsiteStatus);
+import { WebsiteStatus } from '@prisma/client';
 
 const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
 
@@ -12,63 +8,32 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
    * GET /api/public/websites
    *
    * Public endpoint để lấy danh sách domains
-   * Yêu cầu API Key qua header (x-api-key) hoặc query (?apikey=)
    *
-   * Query params:
-   * - type: WebsiteType (ENTITY, GG_STACKING, etc.)
-   * - status: WebsiteStatus (NEW, RUNNING, etc.)
+   * SECURITY:
+   * - API Key PHẢI được gửi qua header x-api-key (KHÔNG qua URL query)
+   * - Mỗi API key chỉ được phép truy cập 1 type cụ thể (ENTITY, BLOG2, PODCAST, etc.)
+   * - Chỉ trả về websites có status=RUNNING
    *
    * Response: string[] (mảng domain)
+   *
+   * Example:
+   * curl -H "x-api-key: lkp_blog2_xxx" "https://sites.likepion.com/api/public/websites"
+   * -> Trả về danh sách BLOG2 websites với status=RUNNING
    */
-  fastify.get<{
-    Querystring: {
-      type?: string;
-      status?: string;
-      apikey?: string;
-    };
-  }>(
+  fastify.get(
     '/websites',
     { preHandler: apiKeyMiddleware },
-    async (request, reply) => {
-      const { type, status } = request.query;
+    async (request) => {
+      // Type và status được xác định từ API key
+      // - Type: từ request.allowedType (set bởi middleware)
+      // - Status: luôn là RUNNING (bắt buộc)
 
-      // Validate type
-      if (type && !VALID_TYPES.includes(type as WebsiteType)) {
-        return reply.status(400).send({
-          statusCode: 400,
-          error: 'Bad Request',
-          message: `Invalid type. Valid values: ${VALID_TYPES.join(', ')}`,
-        });
-      }
-
-      // Validate status
-      if (status && !VALID_STATUSES.includes(status as WebsiteStatus)) {
-        return reply.status(400).send({
-          statusCode: 400,
-          error: 'Bad Request',
-          message: `Invalid status. Valid values: ${VALID_STATUSES.join(', ')}`,
-        });
-      }
-
-      // Build where clause
-      const where: {
-        deletedAt: null;
-        types?: { has: WebsiteType };
-        status?: WebsiteStatus;
-      } = {
-        deletedAt: null,
-      };
-
-      if (type) {
-        where.types = { has: type as WebsiteType };
-      }
-      if (status) {
-        where.status = status as WebsiteStatus;
-      }
-
-      // Fetch only domains
       const websites = await fastify.prisma.website.findMany({
-        where,
+        where: {
+          deletedAt: null,
+          types: { has: request.allowedType! },
+          status: WebsiteStatus.RUNNING,
+        },
         select: {
           domain: true,
         },
@@ -79,6 +44,47 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
 
       // Return array of domains
       return websites.map((w) => w.domain);
+    }
+  );
+
+  /**
+   * GET /api/public/websites/count
+   *
+   * Public endpoint để lấy số lượng domains đang RUNNING
+   *
+   * SECURITY:
+   * - API Key PHẢI được gửi qua header x-api-key (KHÔNG qua URL query)
+   * - Mỗi API key chỉ được phép xem count của type tương ứng
+   * - Chỉ trả về số lượng websites có status=RUNNING
+   *
+   * Response:
+   * {
+   *   "type": "BLOG2",
+   *   "count": 100
+   * }
+   *
+   * Example:
+   * curl -H "x-api-key: lkp_blog2_xxx" "https://sites.likepion.com/api/public/websites/count"
+   */
+  fastify.get(
+    '/websites/count',
+    { preHandler: apiKeyMiddleware },
+    async (request) => {
+      const allowedType = request.allowedType!;
+
+      // Đếm số lượng websites RUNNING
+      const count = await fastify.prisma.website.count({
+        where: {
+          deletedAt: null,
+          types: { has: allowedType },
+          status: WebsiteStatus.RUNNING,
+        },
+      });
+
+      return {
+        type: allowedType,
+        count,
+      };
     }
   );
 };
