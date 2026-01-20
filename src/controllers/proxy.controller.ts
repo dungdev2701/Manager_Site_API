@@ -14,11 +14,11 @@ export class ProxyController {
   /**
    * Get all proxies
    * GET /proxies/list
+   * Supports authentication via JWT token or API key
    */
   static async findAll(request: FastifyRequest, reply: FastifyReply) {
-    if (!request.user) {
-      return ResponseHelper.unauthorized(reply, 'Authentication required');
-    }
+    // Note: Authentication is handled by authOrApiKeyMiddleware
+    // request.user may be undefined when using API key authentication
 
     // Validate query params
     const query: ProxyQueryDTO = proxyQuerySchema.parse(request.query);
@@ -36,6 +36,7 @@ export class ProxyController {
       country: query.country,
       sortBy: query.sortBy as 'ip' | 'createdAt' | 'status' | 'type' | 'responseTime' | 'lastCheckedAt' | undefined,
       sortOrder: query.sortOrder as 'asc' | 'desc' | undefined,
+      random: query.random,
     });
 
     return ResponseHelper.success(reply, result);

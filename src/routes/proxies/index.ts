@@ -1,13 +1,16 @@
 import { FastifyPluginAsync } from 'fastify';
 import { ProxyController } from '../../controllers/proxy.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
+import { authOrApiKeyMiddleware } from '../../middlewares/auth-or-apikey.middleware';
 
 const proxyRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
   // All routes require authentication
   const authPreHandler = [authMiddleware];
+  // Routes that allow API key authentication
+  const authOrApiKeyPreHandler = [authOrApiKeyMiddleware];
 
-  // GET /proxies/list - Get all proxies
-  fastify.get('/list', { preHandler: authPreHandler }, ProxyController.findAll);
+  // GET /proxies/list - Get all proxies (supports JWT or API key)
+  fastify.get('/list', { preHandler: authOrApiKeyPreHandler }, ProxyController.findAll);
 
   // GET /proxies/detail/:id - Get proxy by ID
   fastify.get('/detail/:id', { preHandler: authPreHandler }, ProxyController.findOne);

@@ -36,6 +36,7 @@ export interface ProxyQueryInput {
   country?: string;
   sortBy?: 'ip' | 'createdAt' | 'status' | 'type' | 'responseTime' | 'lastCheckedAt';
   sortOrder?: 'asc' | 'desc';
+  random?: boolean;
 }
 
 interface ParsedProxy {
@@ -184,22 +185,40 @@ export class ProxyServiceClass {
       where.country = query.country;
     }
 
-    // Build orderBy
-    const orderBy: Prisma.ProxyOrderByWithRelationInput = {};
-    const sortBy = query.sortBy || 'createdAt';
-    const sortOrder = query.sortOrder || 'desc';
-    orderBy[sortBy] = sortOrder;
+    // Get total count
+    const total = await this.fastify.prisma.proxy.count({ where });
 
-    // Get proxies and count
-    const [proxies, total] = await Promise.all([
-      this.fastify.prisma.proxy.findMany({
+    let proxies;
+
+    if (query.random && limit < total) {
+      // Random selection: get all IDs matching filter, then randomly pick `limit` items
+      const allIds = await this.fastify.prisma.proxy.findMany({
+        where,
+        select: { id: true },
+      });
+
+      // Shuffle and pick random IDs
+      const shuffled = allIds.sort(() => Math.random() - 0.5);
+      const randomIds = shuffled.slice(0, limit).map((p) => p.id);
+
+      // Fetch full proxy data for random IDs
+      proxies = await this.fastify.prisma.proxy.findMany({
+        where: { id: { in: randomIds } },
+      });
+    } else {
+      // Normal pagination with sorting
+      const orderBy: Prisma.ProxyOrderByWithRelationInput = {};
+      const sortBy = query.sortBy || 'createdAt';
+      const sortOrder = query.sortOrder || 'desc';
+      orderBy[sortBy] = sortOrder;
+
+      proxies = await this.fastify.prisma.proxy.findMany({
         skip,
         take: limit,
         where,
         orderBy,
-      }),
-      this.fastify.prisma.proxy.count({ where }),
-    ]);
+      });
+    }
 
     return {
       data: proxies,

@@ -53,6 +53,10 @@ export const proxyQuerySchema = paginationSchema.merge(searchSchema).merge(
     country: z.string().optional(),
     sortBy: z.enum(['ip', 'createdAt', 'status', 'type', 'responseTime', 'lastCheckedAt']).optional().default('createdAt'),
     sortOrder: z.enum(['asc', 'desc']).optional().default('desc'),
+    random: z
+      .string()
+      .optional()
+      .transform((val) => val === 'true' || val === '1'),
   })
 );
 
