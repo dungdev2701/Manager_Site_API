@@ -1,9 +1,63 @@
 import { FastifyInstance } from 'fastify';
 
+// In-memory cache for statistics (reduces DB load significantly)
+interface CacheEntry<T> {
+  data: T;
+  timestamp: number;
+}
+
+const statisticsCache = new Map<string, CacheEntry<unknown>>();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
+
+function getCached<T>(key: string): T | null {
+  const entry = statisticsCache.get(key);
+  if (entry && Date.now() - entry.timestamp < CACHE_TTL_MS) {
+    return entry.data as T;
+  }
+  return null;
+}
+
+function setCache<T>(key: string, data: T): void {
+  statisticsCache.set(key, { data, timestamp: Date.now() });
+}
+
+// Clear cache for specific prefix (call when data changes)
+export function clearStatisticsCache(prefix?: string): void {
+  if (prefix) {
+    for (const key of statisticsCache.keys()) {
+      if (key.startsWith(prefix)) {
+        statisticsCache.delete(key);
+      }
+    }
+  } else {
+    statisticsCache.clear();
+  }
+}
+
 export class StatisticsService {
   constructor(private fastify: FastifyInstance) {}
 
   async getOverview() {
+    // Check cache first
+    const cacheKey = 'overview';
+    type OverviewResult = {
+      totalWebsites: number;
+      totalUsers: number;
+      websitesThisWeek: number;
+      runningPercentage: number;
+      statusCounts: { status: string; count: number }[];
+      typeCounts: { type: string; count: number }[];
+      allocationStats: {
+        totalAllocations: number;
+        totalSuccess: number;
+        totalFailure: number;
+        overallSuccessRate: number;
+        period: string;
+      };
+    };
+    const cached = getCached<OverviewResult>(cacheKey);
+    if (cached) return cached;
+
     const prisma = this.fastify.prisma;
 
     // Get total websites count
@@ -18,18 +72,14 @@ export class StatisticsService {
       _count: { status: true },
     });
 
-    // Get type counts (since types is array, we count occurrences of each type)
-    const allWebsites = await prisma.website.findMany({
-      where: { deletedAt: null },
-      select: { types: true },
-    });
-    const typeCountMap: Record<string, number> = {};
-    for (const w of allWebsites) {
-      for (const t of w.types) {
-        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
-      }
-    }
-    const typeCounts = Object.entries(typeCountMap).map(([type, count]) => ({ type, count }));
+    // Get type counts using raw SQL with unnest (optimized for PostgreSQL arrays)
+    const typeCountsRaw = await prisma.$queryRaw<Array<{ type: string; count: bigint }>>`
+      SELECT unnest(types) as type, COUNT(*) as count
+      FROM websites
+      WHERE "deletedAt" IS NULL
+      GROUP BY unnest(types)
+    `;
+    const typeCounts = typeCountsRaw.map((t) => ({ type: t.type, count: Number(t.count) }));
 
     // Get total users
     const totalUsers = await prisma.user.count({
@@ -77,7 +127,7 @@ export class StatisticsService {
         ? Math.round((runningCount / totalWebsites) * 100 * 100) / 100
         : 0;
 
-    return {
+    const result = {
       totalWebsites,
       totalUsers,
       websitesThisWeek,
@@ -95,6 +145,10 @@ export class StatisticsService {
         period: '30 days',
       },
     };
+
+    // Cache the result
+    setCache(cacheKey, result);
+    return result;
   }
 
   async getByStatus() {
@@ -118,22 +172,18 @@ export class StatisticsService {
   async getByType() {
     const prisma = this.fastify.prisma;
 
-    // Since types is an array, count occurrences of each type
-    const allWebsites = await prisma.website.findMany({
-      where: { deletedAt: null },
-      select: { types: true },
-    });
+    // Use raw SQL with unnest for efficient array counting
+    const typeCountsRaw = await prisma.$queryRaw<Array<{ type: string; count: bigint }>>`
+      SELECT unnest(types) as type, COUNT(*) as count
+      FROM websites
+      WHERE "deletedAt" IS NULL
+      GROUP BY unnest(types)
+    `;
 
-    const typeCountMap: Record<string, number> = {};
-    for (const w of allWebsites) {
-      for (const t of w.types) {
-        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
-      }
-    }
+    const typeCounts = typeCountsRaw.map((t) => ({ type: t.type, count: Number(t.count) }));
+    const total = typeCounts.reduce((sum, t) => sum + t.count, 0);
 
-    const total = Object.values(typeCountMap).reduce((sum, count) => sum + count, 0);
-
-    return Object.entries(typeCountMap).map(([type, count]) => ({
+    return typeCounts.map(({ type, count }) => ({
       type,
       count,
       percentage: total > 0 ? Math.round((count / total) * 100 * 100) / 100 : 0,
@@ -161,6 +211,18 @@ export class StatisticsService {
       },
     });
 
+    // Build Map for O(1) lookup instead of O(n) .find()
+    const statsMap = new Map(
+      dailyStats.map((d) => [
+        d.date.toISOString().split('T')[0],
+        {
+          allocations: d._sum.allocationCount || 0,
+          success: d._sum.successCount || 0,
+          failure: d._sum.failureCount || 0,
+        },
+      ])
+    );
+
     // Fill in missing dates with zeros
     const result: {
       date: string;
@@ -173,13 +235,11 @@ export class StatisticsService {
     const currentDate = new Date(startDate);
     while (currentDate <= endDate) {
       const dateKey = currentDate.toISOString().split('T')[0];
-      const dayStats = dailyStats.find(
-        (d) => d.date.toISOString().split('T')[0] === dateKey
-      );
+      const dayStats = statsMap.get(dateKey); // O(1) lookup
 
-      const allocations = dayStats?._sum.allocationCount || 0;
-      const success = dayStats?._sum.successCount || 0;
-      const failure = dayStats?._sum.failureCount || 0;
+      const allocations = dayStats?.allocations || 0;
+      const success = dayStats?.success || 0;
+      const failure = dayStats?.failure || 0;
       const successRate =
         allocations > 0 ? Math.round((success / allocations) * 100 * 100) / 100 : 0;
 
@@ -294,33 +354,26 @@ export class StatisticsService {
   async getEditorStats(startDate: Date, endDate: Date) {
     const prisma = this.fastify.prisma;
 
-    // Get all edits in the period
-    const edits = await prisma.auditLog.findMany({
-      where: {
-        entity: 'Website',
-        action: 'UPDATE',
-        createdAt: {
-          gte: startDate,
-          lte: endDate,
-        },
-        userId: { not: null },
-      },
-      select: {
-        userId: true,
-        createdAt: true,
-      },
-    });
+    // OPTIMIZED: Use raw SQL with GROUP BY to aggregate in database
+    // instead of fetching all records and grouping in JavaScript
+    const editorCounts = await prisma.$queryRaw<Array<{ userId: string; count: bigint }>>`
+      SELECT "userId", COUNT(*) as count
+      FROM audit_logs
+      WHERE entity = 'Website'
+        AND action = 'UPDATE'
+        AND "createdAt" >= ${startDate}
+        AND "createdAt" <= ${endDate}
+        AND "userId" IS NOT NULL
+      GROUP BY "userId"
+      ORDER BY count DESC
+    `;
 
-    // Group by user
-    const userEdits = new Map<string, number>();
-    for (const edit of edits) {
-      if (edit.userId) {
-        userEdits.set(edit.userId, (userEdits.get(edit.userId) || 0) + 1);
-      }
+    if (editorCounts.length === 0) {
+      return [];
     }
 
-    // Get user details
-    const userIds = Array.from(userEdits.keys());
+    // Get user details for the found user IDs
+    const userIds = editorCounts.map(e => e.userId);
     const users = await prisma.user.findMany({
       where: { id: { in: userIds } },
       select: {
@@ -333,9 +386,9 @@ export class StatisticsService {
 
     const userMap = new Map(users.map((u) => [u.id, u]));
 
-    // Build result
-    const result = Array.from(userEdits.entries())
-      .map(([userId, editCount]) => {
+    // Build result (already sorted by count DESC from SQL)
+    const result = editorCounts
+      .map(({ userId, count }) => {
         const user = userMap.get(userId);
         if (!user) return null;
 
@@ -344,11 +397,10 @@ export class StatisticsService {
           name: user.name,
           email: user.email,
           role: user.role,
-          editCount,
+          editCount: Number(count),
         };
       })
-      .filter((e) => e !== null)
-      .sort((a, b) => b.editCount - a.editCount);
+      .filter((e) => e !== null);
 
     return result;
   }
@@ -606,21 +658,14 @@ export class StatisticsService {
       _count: { status: true },
     });
 
-    // Get type counts for websites added by this CTV (types is array)
-    const ctvWebsites = await prisma.website.findMany({
-      where: {
-        deletedAt: null,
-        createdBy: userId,
-      },
-      select: { types: true },
-    });
-    const ctvTypeCountMap: Record<string, number> = {};
-    for (const w of ctvWebsites) {
-      for (const t of w.types) {
-        ctvTypeCountMap[t] = (ctvTypeCountMap[t] || 0) + 1;
-      }
-    }
-    const typeCounts = Object.entries(ctvTypeCountMap).map(([type, count]) => ({ type, count }));
+    // Get type counts for websites added by this CTV using raw SQL
+    const typeCountsRaw = await prisma.$queryRaw<Array<{ type: string; count: bigint }>>`
+      SELECT unnest(types) as type, COUNT(*) as count
+      FROM websites
+      WHERE "deletedAt" IS NULL AND "createdBy" = ${userId}
+      GROUP BY unnest(types)
+    `;
+    const typeCounts = typeCountsRaw.map((t) => ({ type: t.type, count: Number(t.count) }));
 
     // Get websites added this week by CTV
     const oneWeekAgo = new Date();
@@ -682,25 +727,18 @@ export class StatisticsService {
   async getCTVByType(userId: string) {
     const prisma = this.fastify.prisma;
 
-    // Since types is an array, count occurrences of each type
-    const websites = await prisma.website.findMany({
-      where: {
-        deletedAt: null,
-        createdBy: userId,
-      },
-      select: { types: true },
-    });
+    // Use raw SQL with unnest for efficient array counting
+    const typeCountsRaw = await prisma.$queryRaw<Array<{ type: string; count: bigint }>>`
+      SELECT unnest(types) as type, COUNT(*) as count
+      FROM websites
+      WHERE "deletedAt" IS NULL AND "createdBy" = ${userId}
+      GROUP BY unnest(types)
+    `;
 
-    const typeCountMap: Record<string, number> = {};
-    for (const w of websites) {
-      for (const t of w.types) {
-        typeCountMap[t] = (typeCountMap[t] || 0) + 1;
-      }
-    }
+    const typeCounts = typeCountsRaw.map((t) => ({ type: t.type, count: Number(t.count) }));
+    const total = typeCounts.reduce((sum, t) => sum + t.count, 0);
 
-    const total = Object.values(typeCountMap).reduce((sum, count) => sum + count, 0);
-
-    return Object.entries(typeCountMap).map(([type, count]) => ({
+    return typeCounts.map(({ type, count }) => ({
       type,
       count,
       percentage: total > 0 ? Math.round((count / total) * 100 * 100) / 100 : 0,
@@ -710,29 +748,27 @@ export class StatisticsService {
   async getCTVDailyTrends(userId: string, startDate: Date, endDate: Date) {
     const prisma = this.fastify.prisma;
 
-    // Get websites created by this CTV grouped by date
-    const websites = await prisma.website.findMany({
-      where: {
-        deletedAt: null,
-        createdBy: userId,
-        createdAt: {
-          gte: startDate,
-          lte: endDate,
-        },
-      },
-      select: {
-        createdAt: true,
-      },
-    });
+    // OPTIMIZED: Use raw SQL with GROUP BY DATE() to aggregate in database
+    // instead of fetching all records and grouping in JavaScript
+    const dailyCounts = await prisma.$queryRaw<Array<{ date: Date; count: bigint }>>`
+      SELECT DATE("createdAt") as date, COUNT(*) as count
+      FROM websites
+      WHERE "deletedAt" IS NULL
+        AND "createdBy" = ${userId}
+        AND "createdAt" >= ${startDate}
+        AND "createdAt" <= ${endDate}
+      GROUP BY DATE("createdAt")
+      ORDER BY date ASC
+    `;
 
-    // Count websites by date
+    // Build Map for O(1) lookup
     const websitesByDate = new Map<string, number>();
-    for (const w of websites) {
-      const dateKey = w.createdAt.toISOString().split('T')[0];
-      websitesByDate.set(dateKey, (websitesByDate.get(dateKey) || 0) + 1);
+    for (const row of dailyCounts) {
+      const dateKey = row.date.toISOString().split('T')[0];
+      websitesByDate.set(dateKey, Number(row.count));
     }
 
-    // Build result array
+    // Build result array with all dates in range
     const result: { date: string; websitesCreated: number }[] = [];
     const currentDate = new Date(startDate);
     while (currentDate <= endDate) {
@@ -928,32 +964,49 @@ export class StatisticsService {
   async getCTVIncomeStats(userId: string, startDate: Date, endDate: Date) {
     const prisma = this.fastify.prisma;
 
-    // Get all completed websites (PENDING + RUNNING) by this CTV with their dates
-    const completedWebsites = await prisma.website.findMany({
-      where: {
-        deletedAt: null,
-        createdBy: userId,
-        status: { in: ['PENDING', 'RUNNING'] },
-      },
-      select: {
-        id: true,
-        domain: true,
-        status: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-      orderBy: { updatedAt: 'desc' },
+    // OPTIMIZED: Get CTV website IDs first (only IDs, not full data)
+    const ctvWebsiteIds = await prisma.website.findMany({
+      where: { createdBy: userId, deletedAt: null },
+      select: { id: true },
     });
+    const ctvWebsiteIdSet = new Set(ctvWebsiteIds.map(w => w.id));
 
-    // Calculate total income from completed websites
-    const totalCompletedCount = completedWebsites.length;
-    const totalIncome = totalCompletedCount * this.PRICE_PER_COMPLETED_WEBSITE;
+    // Get completed websites count and top 10 in parallel
+    const [completedCount, topCompletedWebsites] = await Promise.all([
+      prisma.website.count({
+        where: {
+          deletedAt: null,
+          createdBy: userId,
+          status: { in: ['PENDING', 'RUNNING'] },
+        },
+      }),
+      prisma.website.findMany({
+        where: {
+          deletedAt: null,
+          createdBy: userId,
+          status: { in: ['PENDING', 'RUNNING'] },
+        },
+        select: {
+          id: true,
+          domain: true,
+          status: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        orderBy: { updatedAt: 'desc' },
+        take: 10, // Only get top 10 instead of all
+      }),
+    ]);
 
-    // Get websites that moved to PENDING or RUNNING status in the date range
+    const totalIncome = completedCount * this.PRICE_PER_COMPLETED_WEBSITE;
+
+    // OPTIMIZED: Only get audit logs for CTV's websites (filter by entityId)
+    // This avoids scanning the entire audit_logs table
     const auditLogs = await prisma.auditLog.findMany({
       where: {
         entity: 'Website',
         action: 'UPDATE',
+        entityId: { in: Array.from(ctvWebsiteIdSet) }, // Filter by CTV's websites
         createdAt: {
           gte: startDate,
           lte: endDate,
@@ -967,19 +1020,12 @@ export class StatisticsService {
       },
     });
 
-    // Get all CTV websites
-    const allCtvWebsites = await prisma.website.findMany({
-      where: { createdBy: userId },
-      select: { id: true },
-    });
-    const allCtvWebsiteIds = new Set(allCtvWebsites.map(w => w.id));
-
     // Track which websites have already been counted as completed
     const countedWebsites = new Set<string>();
     const transitionsByDate = new Map<string, number>();
 
     for (const log of auditLogs) {
-      if (!log.entityId || !allCtvWebsiteIds.has(log.entityId)) continue;
+      if (!log.entityId) continue;
       if (countedWebsites.has(log.entityId)) continue;
 
       const newValues = log.newValues as Record<string, unknown> | null;
@@ -1016,10 +1062,10 @@ export class StatisticsService {
     }
 
     return {
-      totalCompletedCount,
+      totalCompletedCount: completedCount,
       totalIncome,
       pricePerWebsite: this.PRICE_PER_COMPLETED_WEBSITE,
-      completedWebsites: completedWebsites.slice(0, 10), // Top 10 most recent
+      completedWebsites: topCompletedWebsites,
       dailyIncome: dailyIncomeData,
     };
   }

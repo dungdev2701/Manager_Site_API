@@ -61,10 +61,11 @@ export class WebsiteRepository {
   /**
    * Lấy danh sách TẤT CẢ websites (không filter theo userId)
    * OPTIMIZATION:
+   * - Sử dụng raw SQL với JSONB operators để sort trực tiếp trong database
    * - Sử dụng select để chỉ lấy fields cần thiết
    * - Parallel queries với Promise.all để giảm thời gian response
    * - Supports filtering by metrics fields (JSONB)
-   * - Supports sorting by metrics fields
+   * - Supports sorting by metrics fields (traffic, DA) via database
    */
   async findAll(params: {
     skip?: number;
@@ -88,8 +89,8 @@ export class WebsiteRepository {
     createdBy?: string;
   }) {
     const {
-      skip,
-      take,
+      skip = 0,
+      take = 20,
       type,
       status,
       search,
@@ -104,6 +105,31 @@ export class WebsiteRepository {
       endDate,
       createdBy,
     } = params;
+
+    // Default sort by traffic (desc) if no sortBy specified
+    const effectiveSortBy = sortBy || 'traffic';
+    const needsJsonSort = effectiveSortBy === 'traffic' || effectiveSortBy === 'DA';
+
+    // For JSONB sorting, use raw SQL for performance
+    if (needsJsonSort) {
+      return this.findAllWithJsonSort({
+        skip,
+        take,
+        type,
+        status,
+        search,
+        sortBy: effectiveSortBy as 'traffic' | 'DA',
+        sortOrder,
+        index,
+        captcha_type,
+        captcha_provider,
+        required_gmail,
+        verify,
+        startDate,
+        endDate,
+        createdBy,
+      });
+    }
 
     // Build date range filter
     let createdAtFilter: { gte?: Date; lte?: Date } | undefined;
@@ -163,29 +189,20 @@ export class WebsiteRepository {
       }));
     }
 
-    // Build orderBy clause
-    // Default sort by traffic (desc) if no sortBy specified
-    const effectiveSortBy = sortBy || 'traffic';
+    // Build orderBy clause for non-JSONB fields
     let orderBy: Prisma.WebsiteOrderByWithRelationInput = { createdAt: 'desc' };
     if (effectiveSortBy === 'createdAt') {
       orderBy = { createdAt: sortOrder };
     } else if (effectiveSortBy === 'status') {
       orderBy = { status: sortOrder };
     }
-    // Note: For JSONB fields (traffic, DA), we'll sort in memory after fetching
-    // because Prisma doesn't support direct JSONB field ordering
-    const needsJsonSort = effectiveSortBy === 'traffic' || effectiveSortBy === 'DA';
-
-    // OPTIMIZATION: Giới hạn số lượng records khi sort theo JSONB để tránh memory issues
-    // Khi sort theo JSONB, chỉ load tối đa 5000 records (đủ cho hầu hết use cases)
-    const MAX_JSONB_SORT_LIMIT = 5000;
 
     // OPTIMIZATION: Chạy 2 queries song song thay vì tuần tự
     const [websites, total] = await Promise.all([
       this.prisma.website.findMany({
         where,
-        skip: needsJsonSort ? undefined : skip, // Fetch all if we need to sort by JSON field
-        take: needsJsonSort ? MAX_JSONB_SORT_LIMIT : take, // Giới hạn khi sort JSONB
+        skip,
+        take,
         orderBy,
         select: {
           id: true,
@@ -233,7 +250,7 @@ export class WebsiteRepository {
     ]);
 
     // Transform websites to include successRate at top level
-    let websitesWithStats = websites.map((website) => {
+    const websitesWithStats = websites.map((website) => {
       const latestStats = (website as typeof website & { stats: { successRate: number; totalAttempts: number; successCount: number; failureCount: number }[] }).stats[0];
       return {
         ...website,
@@ -243,27 +260,220 @@ export class WebsiteRepository {
       };
     });
 
-    // Sort by JSON field if needed
-    if (needsJsonSort) {
-      websitesWithStats.sort((a, b) => {
-        const metricsA = a.metrics as Record<string, unknown> | null;
-        const metricsB = b.metrics as Record<string, unknown> | null;
-        const valueA = (metricsA?.[effectiveSortBy] as number) ?? 0;
-        const valueB = (metricsB?.[effectiveSortBy] as number) ?? 0;
+    return { websites: websitesWithStats, total };
+  }
 
-        if (sortOrder === 'desc') {
-          return valueB - valueA;
-        }
-        return valueA - valueB;
-      });
+  /**
+   * Optimized findAll for JSONB field sorting using raw SQL
+   * Uses PostgreSQL's JSONB operators to sort directly in database
+   */
+  private async findAllWithJsonSort(params: {
+    skip: number;
+    take: number;
+    type?: WebsiteType;
+    status?: WebsiteStatus;
+    search?: string;
+    sortBy: 'traffic' | 'DA';
+    sortOrder: 'asc' | 'desc';
+    index?: 'yes' | 'no';
+    captcha_type?: 'captcha' | 'normal';
+    captcha_provider?: 'recaptcha' | 'hcaptcha';
+    required_gmail?: 'yes' | 'no';
+    verify?: 'yes' | 'no';
+    startDate?: string;
+    endDate?: string;
+    createdBy?: string;
+  }) {
+    const {
+      skip,
+      take,
+      type,
+      status,
+      search,
+      sortBy,
+      sortOrder,
+      index,
+      captcha_type,
+      captcha_provider,
+      required_gmail,
+      verify,
+      startDate,
+      endDate,
+      createdBy,
+    } = params;
 
-      // Apply pagination after sorting
-      if (skip !== undefined || take !== undefined) {
-        const startIndex = skip || 0;
-        const endIndex = take ? startIndex + take : undefined;
-        websitesWithStats = websitesWithStats.slice(startIndex, endIndex);
-      }
+    // Build WHERE conditions dynamically
+    const conditions: string[] = ['"deletedAt" IS NULL'];
+    const queryParams: unknown[] = [];
+    let paramIndex = 1;
+
+    if (type) {
+      // Cast to "WebsiteType" enum for proper comparison with types array
+      conditions.push(`$${paramIndex}::"WebsiteType" = ANY(types)`);
+      queryParams.push(type);
+      paramIndex++;
     }
+
+    if (status) {
+      conditions.push(`status = $${paramIndex}::"WebsiteStatus"`);
+      queryParams.push(status);
+      paramIndex++;
+    }
+
+    if (search) {
+      conditions.push(`domain ILIKE $${paramIndex}`);
+      queryParams.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    if (startDate) {
+      conditions.push(`"createdAt" >= $${paramIndex}::timestamp`);
+      queryParams.push(new Date(startDate));
+      paramIndex++;
+    }
+
+    if (endDate) {
+      const endOfDay = new Date(endDate);
+      endOfDay.setHours(23, 59, 59, 999);
+      conditions.push(`"createdAt" <= $${paramIndex}::timestamp`);
+      queryParams.push(endOfDay);
+      paramIndex++;
+    }
+
+    if (createdBy) {
+      conditions.push(`"createdBy" = $${paramIndex}`);
+      queryParams.push(createdBy);
+      paramIndex++;
+    }
+
+    // JSONB metrics filters
+    if (index) {
+      conditions.push(`metrics->>'index' = $${paramIndex}`);
+      queryParams.push(index);
+      paramIndex++;
+    }
+
+    if (captcha_type) {
+      conditions.push(`metrics->>'captcha_type' = $${paramIndex}`);
+      queryParams.push(captcha_type);
+      paramIndex++;
+    }
+
+    if (captcha_provider) {
+      conditions.push(`metrics->>'captcha_provider' = $${paramIndex}`);
+      queryParams.push(captcha_provider);
+      paramIndex++;
+    }
+
+    if (required_gmail) {
+      conditions.push(`metrics->>'required_gmail' = $${paramIndex}`);
+      queryParams.push(required_gmail);
+      paramIndex++;
+    }
+
+    if (verify) {
+      conditions.push(`metrics->>'verify' = $${paramIndex}`);
+      queryParams.push(verify);
+      paramIndex++;
+    }
+
+    const whereClause = conditions.join(' AND ');
+    const orderDirection = sortOrder.toUpperCase();
+
+    // Query for website IDs with JSONB sorting (fast - only IDs)
+    const idsQuery = `
+      SELECT id
+      FROM websites
+      WHERE ${whereClause}
+      ORDER BY COALESCE((metrics->>'${sortBy}')::numeric, 0) ${orderDirection}
+      LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+    `;
+    queryParams.push(take, skip);
+
+    // Count query
+    const countQuery = `
+      SELECT COUNT(*)::int as count
+      FROM websites
+      WHERE ${whereClause}
+    `;
+
+    // Execute both queries in parallel
+    const [idsResult, countResult] = await Promise.all([
+      this.prisma.$queryRawUnsafe<Array<{ id: string }>>(idsQuery, ...queryParams),
+      this.prisma.$queryRawUnsafe<Array<{ count: number }>>(
+        countQuery,
+        ...queryParams.slice(0, -2) // Remove LIMIT and OFFSET params
+      ),
+    ]);
+
+    const websiteIds = idsResult.map(r => r.id);
+    const total = countResult[0]?.count ?? 0;
+
+    if (websiteIds.length === 0) {
+      return { websites: [], total };
+    }
+
+    // Fetch full website data for the IDs (with relations)
+    const websites = await this.prisma.website.findMany({
+      where: {
+        id: { in: websiteIds },
+      },
+      select: {
+        id: true,
+        domain: true,
+        types: true,
+        status: true,
+        notes: true,
+        metrics: true,
+        priority: true,
+        category: true,
+        tags: true,
+        createdAt: true,
+        updatedAt: true,
+        lastCheckedAt: true,
+        creator: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        checker: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        stats: {
+          select: {
+            successRate: true,
+            totalAttempts: true,
+            successCount: true,
+            failureCount: true,
+          },
+          orderBy: { periodStart: 'desc' },
+          take: 1,
+        },
+      },
+    });
+
+    // Create a map for O(1) lookup and preserve order from raw query
+    const websiteMap = new Map(websites.map(w => [w.id, w]));
+    const orderedWebsites = websiteIds
+      .map(id => websiteMap.get(id))
+      .filter((w): w is NonNullable<typeof w> => w !== undefined);
+
+    // Transform websites to include successRate at top level
+    const websitesWithStats = orderedWebsites.map((website) => {
+      const latestStats = (website as typeof website & { stats: { successRate: number; totalAttempts: number; successCount: number; failureCount: number }[] }).stats[0];
+      return {
+        ...website,
+        successRate: latestStats?.successRate ?? null,
+        totalAttempts: latestStats?.totalAttempts ?? 0,
+        stats: undefined,
+      };
+    });
 
     return { websites: websitesWithStats, total };
   }
@@ -543,5 +753,34 @@ export class WebsiteRepository {
         },
       },
     });
+  }
+
+  /**
+   * Update nhiều websites theo domain (bulk update)
+   * Sử dụng transaction để đảm bảo atomicity
+   */
+  async updateManyByDomain(
+    updates: Array<{
+      domain: string;
+      types?: WebsiteType[];
+      status?: WebsiteStatus;
+      metrics?: Prisma.InputJsonValue;
+    }>
+  ): Promise<number> {
+    const results = await this.prisma.$transaction(
+      updates.map((item) =>
+        this.prisma.website.updateMany({
+          where: { domain: item.domain, deletedAt: null },
+          data: {
+            ...(item.types && { types: item.types }),
+            ...(item.status && { status: item.status }),
+            ...(item.metrics && { metrics: item.metrics }),
+            lastCheckedAt: new Date(),
+          },
+        })
+      )
+    );
+    // Đếm tổng số records đã update
+    return results.reduce((sum, r) => sum + r.count, 0);
   }
 }

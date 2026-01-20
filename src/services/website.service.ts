@@ -59,6 +59,7 @@ export interface UpdateWebsiteInput {
 
 export interface BulkCreateResult {
   created: number;
+  updated: number;
   duplicates: string[];
   invalid: string[];
   total: number;
@@ -187,6 +188,7 @@ export class WebsiteService {
     // 5. Return kết quả
     return {
       created,
+      updated: 0, // Function này không update existing
       duplicates: Array.from(existingDomains),
       invalid,
       total: input.domains.length,
@@ -249,8 +251,9 @@ export class WebsiteService {
     const existingWebsites = await this.websiteRepository.findManyByDomains(domains);
     const existingDomains = new Set(existingWebsites.map((w) => w.domain));
 
-    // 3. Lọc ra websites mới
+    // 3. Phân loại websites: mới vs đã tồn tại
     const newWebsites = uniqueWebsites.filter((w) => !existingDomains.has(w.domain));
+    const websitesToUpdate = uniqueWebsites.filter((w) => existingDomains.has(w.domain));
 
     // 4. Bulk insert new websites với metrics
     let created = 0;
@@ -266,10 +269,24 @@ export class WebsiteService {
       created = await this.websiteRepository.createMany(createData);
     }
 
-    // 5. Return kết quả
+    // 5. Bulk update existing websites với metrics mới
+    let updated = 0;
+    if (websitesToUpdate.length > 0) {
+      const updateData = websitesToUpdate.map((website) => ({
+        domain: website.domain,
+        types: website.types,
+        status: website.status,
+        metrics: website.metrics as Prisma.InputJsonValue | undefined,
+      }));
+
+      updated = await this.websiteRepository.updateManyByDomain(updateData);
+    }
+
+    // 6. Return kết quả
     return {
       created,
-      duplicates: Array.from(existingDomains),
+      updated,
+      duplicates: Array.from(existingDomains), // Giữ lại để frontend biết domains nào đã được update
       invalid,
       total: input.websites.length,
     };

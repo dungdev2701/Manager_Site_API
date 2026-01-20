@@ -2,6 +2,14 @@ import { FastifyPluginAsync } from 'fastify';
 import { apiKeyMiddleware } from '../../middlewares/apikey.middleware';
 import { WebsiteStatus } from '@prisma/client';
 
+// In-memory cache for public websites endpoint
+// Key: WebsiteType, Value: { data: string[], timestamp: number }
+const websiteCache = new Map<string, { data: string[]; timestamp: number }>();
+const CACHE_TTL_MS = 60 * 1000; // 1 minute cache
+
+// Rate limit: 10 requests per minute per API key
+const PUBLIC_RATE_LIMIT = { max: 600, timeWindow: '1 minute' };
+
 const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
 
   /**
@@ -14,6 +22,10 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
    * - Mỗi API key chỉ được phép truy cập 1 type cụ thể (ENTITY, BLOG2, PODCAST, etc.)
    * - Chỉ trả về websites có status=RUNNING
    *
+   * PERFORMANCE:
+   * - Results are cached for 1 minute to reduce database load
+   * - Rate limited: 10 requests per minute per API key
+   *
    * Response: string[] (mảng domain)
    *
    * Example:
@@ -22,16 +34,28 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
    */
   fastify.get(
     '/websites',
-    { preHandler: apiKeyMiddleware },
+    {
+      preHandler: apiKeyMiddleware,
+      config: { rateLimit: PUBLIC_RATE_LIMIT },
+    },
     async (request) => {
       // Type và status được xác định từ API key
       // - Type: từ request.allowedType (set bởi middleware)
       // - Status: luôn là RUNNING (bắt buộc)
+      const allowedType = request.allowedType!;
 
+      // Check cache first
+      const cached = websiteCache.get(allowedType);
+      const now = Date.now();
+      if (cached && now - cached.timestamp < CACHE_TTL_MS) {
+        return cached.data;
+      }
+
+      // Query database
       const websites = await fastify.prisma.website.findMany({
         where: {
           deletedAt: null,
-          types: { has: request.allowedType! },
+          types: { has: allowedType },
           status: WebsiteStatus.RUNNING,
         },
         select: {
@@ -42,8 +66,11 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
         },
       });
 
-      // Return array of domains
-      return websites.map((w) => w.domain);
+      // Cache result
+      const domains = websites.map((w) => w.domain);
+      websiteCache.set(allowedType, { data: domains, timestamp: now });
+
+      return domains;
     }
   );
 
@@ -68,7 +95,10 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
    */
   fastify.get(
     '/websites/count',
-    { preHandler: apiKeyMiddleware },
+    {
+      preHandler: apiKeyMiddleware,
+      config: { rateLimit: PUBLIC_RATE_LIMIT },
+    },
     async (request) => {
       const allowedType = request.allowedType!;
 

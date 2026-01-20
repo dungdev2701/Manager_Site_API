@@ -344,8 +344,8 @@ export class WebsiteController {
       return ResponseHelper.badRequest(reply, 'IDs array is required');
     }
 
-    if (ids.length > 1000) {
-      return ResponseHelper.badRequest(reply, 'Maximum 1000 IDs allowed');
+    if (ids.length > 5000) {
+      return ResponseHelper.badRequest(reply, 'Maximum 5000 IDs allowed');
     }
 
     const websiteService = new WebsiteService(request.server);

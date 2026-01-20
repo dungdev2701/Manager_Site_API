@@ -24,6 +24,9 @@ model User {
   websitesChecked  Website[]         @relation("WebsiteChecker")
   registrationLogs RegistrationLog[]
   websiteStats     WebsiteStats[]
+  gmails           Gmail[]
+  gmailUsages      GmailUsage[]
+  tools            Tool[]
 
   @@map("users")
 }
@@ -78,6 +81,10 @@ model Website {
   @@index([checkerId])
   @@index([createdAt])
   @@index([deletedAt])
+  // Composite indexes for common queries
+  @@index([status, deletedAt])
+  @@index([deletedAt, status])
+  @@index([deletedAt, createdAt])
   @@map("websites")
 }
 
@@ -187,6 +194,9 @@ model WebsiteStats {
   @@index([websiteId, periodType, periodStart])
   @@index([websiteId])
   @@index([periodStart, periodEnd])
+  // Additional composite indexes for statistics
+  @@index([userId, periodType])
+  @@index([periodType, periodStart])
   @@map("website_stats")
 }
 
@@ -229,6 +239,13 @@ model AuditLog {
   @@index([userId])
   @@index([entity, entityId])
   @@index([createdAt])
+  // Composite indexes for statistics queries
+  @@index([userId, createdAt])
+  @@index([entity, createdAt])
+  @@index([action, entity, createdAt])
+  // Index for filtering by entityId with date range (used in getCTVIncomeStats, getCTVStatusChanges)
+  @@index([entityId, createdAt])
+  @@index([entity, action, entityId, createdAt])
   @@map("audit_logs")
 }
 
@@ -382,4 +399,188 @@ enum AlertSeverity {
   WARNING
   ERROR
   CRITICAL
+}
+
+// ==================== GMAIL MANAGEMENT ====================
+model Gmail {
+  id              String       @id @default(uuid())
+  email           String       @unique
+  password        String
+  appPassword     String?      @map("app_password")
+  twoFA           String?      @map("2fa")
+  recoveryEmail   String?      @map("recovery_email")
+
+  // Owner - người sở hữu gmail này (người đầu tiên sử dụng)
+  ownerId         String?      @map("owner_id")
+  owner           User?        @relation(fields: [ownerId], references: [id], onDelete: SetNull)
+
+  // Status
+  status          GmailStatus  @default(SUCCESS)
+
+  // Timestamps
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  deletedAt       DateTime?    // Soft delete
+
+  // Relations
+  usages          GmailUsage[]
+
+  @@index([email])
+  @@index([ownerId])
+  @@index([status])
+  @@index([deletedAt])
+  @@map("gmails")
+}
+
+// Track lịch sử sử dụng Gmail (mỗi lần export)
+model GmailUsage {
+  id          String   @id @default(uuid())
+  gmailId     String   @map("gmail_id")
+  userId      String   @map("user_id")
+
+  // Timestamps
+  usedAt      DateTime @default(now())
+
+  // Relations
+  gmail       Gmail    @relation(fields: [gmailId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([gmailId])
+  @@index([userId])
+  @@index([usedAt])
+  @@map("gmail_usages")
+}
+
+enum GmailStatus {
+  SUCCESS     // Thành công
+  FAILED      // Thất bại
+}
+
+// ==================== TOOL MANAGEMENT ====================
+model Tool {
+  id              String          @id @default(uuid())
+
+  // User relationship
+  userId          String?         @map("user_id")
+  user            User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Tool info
+  idTool          String          @map("id_tool")
+  threadNumber    Int             @default(1) @map("thread_number")
+
+  // Type & Status
+  type            ToolType        @default(INDIVIDUAL)
+  status          ToolStatus      @default(RUNNING)
+  service         ToolService     @default(ENTITY)
+
+  // Time tracking
+  estimateTime    Int?            @map("estimate_time") // Thời gian ước tính (phút/giây)
+
+  // Customer info
+  customerType    String?         @map("customer_type")
+
+  // Timestamps
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  deletedAt       DateTime?       // Soft delete
+
+  @@index([userId])
+  @@index([idTool])
+  @@index([type])
+  @@index([status])
+  @@index([service])
+  @@index([deletedAt])
+  @@map("tools")
+}
+
+enum ToolType {
+  INDIVIDUAL    // Cá nhân
+  GLOBAL        // Toàn cục
+  CANCEL        // Hủy
+  RE_RUNNING    // Chạy lại
+}
+
+enum ToolStatus {
+  RUNNING       // Đang chạy
+  DIE           // Chết/Dừng
+}
+
+enum ToolService {
+  ENTITY          // Entity
+  SOCIAL          // Social
+  INDEX           // Index
+  GOOGLE_STACKING // Google Stacking
+  BLOG            // Blog
+  PODCAST         // Podcast
+}
+
+// ==================== PROXY MANAGEMENT ====================
+model Proxy {
+  id              String          @id @default(uuid())
+
+  // Connection info
+  ip              String
+  port            Int
+  username        String?
+  password        String?
+
+  // Type & Protocol
+  type            ProxyType       @default(IPV4_STATIC)
+  protocol        ProxyProtocol   @default(HTTP)
+
+  // Services this proxy is used for
+  services        ProxyServiceType[] @default([])
+
+  // Status & Health
+  status          ProxyStatus     @default(UNKNOWN)
+  lastCheckedAt   DateTime?       @map("last_checked_at")
+  responseTime    Int?            @map("response_time") // in milliseconds
+  failCount       Int             @default(0) @map("fail_count")
+
+  // Location
+  country         String?         @db.VarChar(2)
+
+  // Notes
+  note            String?         @db.Text
+
+  // Timestamps
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([ip, port])
+  @@index([type])
+  @@index([protocol])
+  @@index([status])
+  @@index([services])
+  @@index([createdAt])
+  @@map("proxies")
+}
+
+enum ProxyType {
+  IPV4_STATIC     // Proxy IPv4 tĩnh
+  IPV6_STATIC     // Proxy IPv6 tĩnh
+  SOCKS5          // Proxy SOCKS5
+  ROTATING        // Proxy xoay
+}
+
+enum ProxyProtocol {
+  HTTP
+  HTTPS
+  SOCKS4
+  SOCKS5
+}
+
+enum ProxyStatus {
+  ACTIVE          // Hoạt động tốt
+  DEAD            // Chết/Không hoạt động
+  CHECKING        // Đang kiểm tra
+  UNKNOWN         // Chưa kiểm tra
+}
+
+enum ProxyServiceType {
+  ENTITY          // Entity
+  BLOG_2_0        // Blog 2.0
+  PODCAST         // Podcast
+  SOCIAL          // Social
+  GG_STACKING     // GG Stacking
 }
