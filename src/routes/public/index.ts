@@ -1,6 +1,8 @@
 import { FastifyPluginAsync } from 'fastify';
 import { apiKeyMiddleware } from '../../middlewares/apikey.middleware';
+import { monitorApiKeyMiddleware } from '../../middlewares/monitor.middleware';
 import { WebsiteStatus } from '@prisma/client';
+import { ToolController } from '../../controllers/tool.controller';
 
 // In-memory cache for public websites endpoint
 // Key: WebsiteType, Value: { data: string[], timestamp: number }
@@ -114,6 +116,99 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
       return {
         type: allowedType,
         count,
+      };
+    }
+  );
+
+  // ==================== TOOLS HEARTBEAT ENDPOINTS ====================
+
+  /**
+   * POST /api/public/tools/heartbeat
+   *
+   * Endpoint cho tools gửi heartbeat để cập nhật trạng thái và cấu hình
+   *
+   * Body:
+   * {
+   *   "idTool": "Normal 1",       // Required - Tool identifier
+   *   "status": "RUNNING",        // Optional - Default: RUNNING. Values: RUNNING, DIE
+   *   "threadNumber": 5,          // Optional - Số luồng
+   *   "type": "INDIVIDUAL",       // Optional - Values: INDIVIDUAL, GLOBAL, CANCEL, RE_RUNNING
+   *   "service": "ENTITY",        // Optional - Values: ENTITY, SOCIAL, INDEX, GOOGLE_STACKING, BLOG, PODCAST
+   *   "estimateTime": 10          // Optional - Thời gian ước tính (phút)
+   * }
+   *
+   * Response:
+   * {
+   *   "success": true,
+   *   "message": "Heartbeat received",
+   *   "data": {
+   *     "id": "uuid",
+   *     "idTool": "Normal 1",
+   *     "status": "RUNNING",
+   *     "threadNumber": 5,
+   *     "type": "INDIVIDUAL",
+   *     "service": "ENTITY",
+   *     "estimateTime": 10,
+   *     "updatedAt": "2024-01-15T10:00:00.000Z"
+   *   }
+   * }
+   *
+   * Example:
+   * curl -X POST "https://sites.likepion.com/api/public/tools/heartbeat" \
+   *   -H "Content-Type: application/json" \
+   *   -d '{"idTool": "Normal 1", "threadNumber": 5, "estimateTime": 10}'
+   */
+  fastify.post('/tools/heartbeat', ToolController.heartbeat);
+
+  // ==================== MONITOR SERVICE ENDPOINTS ====================
+
+  /**
+   * POST /api/public/monitor/mark-stale-dead
+   *
+   * Endpoint cho Monitor Service để đánh dấu tools không update quá estimateTime thành DIE
+   * - Mỗi tool có estimateTime riêng (đơn vị: phút)
+   * - Nếu tool không có estimateTime → mặc định 5 phút và cập nhật vào DB
+   *
+   * SECURITY:
+   * - API Key PHẢI được gửi qua header x-api-key (Monitor Service API Key)
+   *
+   * Query params:
+   * - staleMinutes (optional): Số phút để xác định tool là stale (default: 5)
+   *
+   * Response:
+   * {
+   *   "success": true,
+   *   "message": "Marked 3 stale tools as DIE",
+   *   "data": {
+   *     "markedCount": 3,
+   *     "tools": [
+   *       { "id": "...", "idTool": "Normal 1", "lastUpdated": "..." }
+   *     ]
+   *   }
+   * }
+   */
+  fastify.post(
+    '/monitor/mark-stale-dead',
+    {
+      preHandler: monitorApiKeyMiddleware,
+    },
+    ToolController.markStaleDead
+  );
+
+  /**
+   * GET /api/public/monitor/health
+   *
+   * Health check endpoint cho Monitor Service
+   */
+  fastify.get(
+    '/monitor/health',
+    {
+      preHandler: monitorApiKeyMiddleware,
+    },
+    async () => {
+      return {
+        status: 'ok',
+        timestamp: new Date().toISOString(),
       };
     }
   );

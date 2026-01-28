@@ -44,6 +44,25 @@ const proxyRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
 
   // POST /proxies/check-stop - Stop ongoing check
   fastify.post('/check-stop', { preHandler: authPreHandler }, ProxyController.stopCheck);
+
+  // ==================== TRASH (Soft Delete) ====================
+  // GET /proxies/trash - Get deleted proxies
+  fastify.get('/trash', { preHandler: authPreHandler }, ProxyController.getTrash);
+
+  // POST /proxies/restore/:id - Restore single deleted proxy
+  fastify.post('/restore/:id', { preHandler: authPreHandler }, ProxyController.restore);
+
+  // POST /proxies/bulk-restore - Bulk restore deleted proxies
+  fastify.post('/bulk-restore', { preHandler: authPreHandler }, ProxyController.bulkRestore);
+
+  // DELETE /proxies/permanent-delete/:id - Permanently delete proxy
+  fastify.delete('/permanent-delete/:id', { preHandler: authPreHandler }, ProxyController.permanentDelete);
+
+  // POST /proxies/bulk-permanent-delete - Bulk permanent delete proxies
+  fastify.post('/bulk-permanent-delete', { preHandler: authPreHandler }, ProxyController.bulkPermanentDelete);
+
+  // POST /proxies/empty-trash - Empty trash
+  fastify.post('/empty-trash', { preHandler: authPreHandler }, ProxyController.emptyTrash);
 };
 
 export default proxyRoutes;

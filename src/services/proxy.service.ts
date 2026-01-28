@@ -90,20 +90,33 @@ export class ProxyServiceClass {
   }
 
   /**
-   * Bulk create proxies from text
+   * Bulk create proxies from text (optimized with batch queries and batch writes)
    */
   async bulkCreateProxies(input: {
     proxies: string;
     type?: ProxyType;
     protocol?: ProxyProtocol;
     services?: ProxyServiceType[];
+    handleTrashed?: 'restore' | 'replace'; // How to handle proxies in trash
   }) {
     const lines = input.proxies.split('\n').filter((line) => line.trim());
     const results = {
       created: 0,
       duplicates: 0,
+      restored: 0,
+      replaced: 0,
       errors: [] as string[],
+      trashedProxies: [] as Array<{ ip: string; port: number; id: string }>,
     };
+
+    // Parse all proxies first
+    const parsedProxies: Array<{
+      ip: string;
+      port: number;
+      username?: string;
+      password?: string;
+      line: string;
+    }> = [];
 
     for (const line of lines) {
       const parsed = this.parseProxyString(line);
@@ -111,40 +124,172 @@ export class ProxyServiceClass {
         results.errors.push(`Invalid format: ${line}`);
         continue;
       }
+      parsedProxies.push({ ...parsed, line });
+    }
 
-      try {
-        // Check for duplicate
-        const existing = await this.fastify.prisma.proxy.findUnique({
-          where: {
-            ip_port: {
-              ip: parsed.ip,
-              port: parsed.port,
-            },
-          },
-        });
+    if (parsedProxies.length === 0) {
+      return results;
+    }
 
-        if (existing) {
-          results.duplicates++;
+    // Build OR conditions for batch query
+    const orConditions = parsedProxies.map((p) => ({
+      ip: p.ip,
+      port: p.port,
+    }));
+
+    // Batch query: get all existing active proxies
+    const existingActiveProxies = await this.fastify.prisma.proxy.findMany({
+      where: {
+        OR: orConditions,
+        deletedAt: null,
+      },
+      select: { ip: true, port: true },
+    });
+
+    // Create a Set for quick lookup
+    const activeSet = new Set(
+      existingActiveProxies.map((p) => `${p.ip}:${p.port}`)
+    );
+
+    // Batch query: get all existing trashed proxies
+    const existingTrashedProxies = await this.fastify.prisma.proxy.findMany({
+      where: {
+        OR: orConditions,
+        deletedAt: { not: null },
+      },
+      select: { id: true, ip: true, port: true },
+    });
+
+    // Create a Map for quick lookup
+    const trashedMap = new Map(
+      existingTrashedProxies.map((p) => [`${p.ip}:${p.port}`, p])
+    );
+
+    // Collect items for batch operations
+    const toCreate: Array<{
+      ip: string;
+      port: number;
+      username: string | null;
+      password: string | null;
+      type: ProxyType;
+      protocol: ProxyProtocol;
+      services: ProxyServiceType[];
+    }> = [];
+    const toRestoreIds: string[] = [];
+    const toDeleteIds: string[] = [];
+    const toReplaceData: Array<{
+      ip: string;
+      port: number;
+      username: string | null;
+      password: string | null;
+    }> = [];
+
+    // Categorize each proxy
+    for (const parsed of parsedProxies) {
+      const key = `${parsed.ip}:${parsed.port}`;
+
+      // Check for duplicate (only among non-deleted proxies)
+      if (activeSet.has(key)) {
+        results.duplicates++;
+        continue;
+      }
+
+      // Check for soft-deleted proxy with same ip:port
+      const existingTrashed = trashedMap.get(key);
+
+      if (existingTrashed) {
+        // If no handleTrashed option specified, collect for user decision
+        if (!input.handleTrashed) {
+          results.trashedProxies.push({
+            ip: parsed.ip,
+            port: parsed.port,
+            id: existingTrashed.id,
+          });
           continue;
         }
 
-        // Create proxy
-        await this.fastify.prisma.proxy.create({
-          data: {
+        // Handle based on user's choice
+        if (input.handleTrashed === 'restore') {
+          toRestoreIds.push(existingTrashed.id);
+          results.restored++;
+          continue;
+        } else if (input.handleTrashed === 'replace') {
+          toDeleteIds.push(existingTrashed.id);
+          toReplaceData.push({
             ip: parsed.ip,
             port: parsed.port,
             username: parsed.username || null,
             password: parsed.password || null,
+          });
+          results.replaced++;
+          continue;
+        }
+      }
+
+      // Collect for batch create
+      toCreate.push({
+        ip: parsed.ip,
+        port: parsed.port,
+        username: parsed.username || null,
+        password: parsed.password || null,
+        type: input.type || ProxyType.IPV4_STATIC,
+        protocol: input.protocol || ProxyProtocol.HTTP,
+        services: input.services || [],
+      });
+      results.created++;
+    }
+
+    // Execute batch operations
+    try {
+      // Batch restore: update all trashed proxies at once
+      if (toRestoreIds.length > 0) {
+        await this.fastify.prisma.proxy.updateMany({
+          where: { id: { in: toRestoreIds } },
+          data: {
+            deletedAt: null,
             type: input.type || ProxyType.IPV4_STATIC,
             protocol: input.protocol || ProxyProtocol.HTTP,
             services: input.services || [],
+            status: ProxyStatus.UNKNOWN,
           },
         });
-
-        results.created++;
-      } catch (error) {
-        results.errors.push(`Error creating ${parsed.ip}:${parsed.port}`);
       }
+
+      // Batch replace: delete old ones first
+      if (toDeleteIds.length > 0) {
+        await this.fastify.prisma.proxy.deleteMany({
+          where: { id: { in: toDeleteIds } },
+        });
+
+        // Then batch create new ones
+        if (toReplaceData.length > 0) {
+          await this.fastify.prisma.proxy.createMany({
+            data: toReplaceData.map((p) => ({
+              ip: p.ip,
+              port: p.port,
+              username: p.username,
+              password: p.password,
+              type: input.type || ProxyType.IPV4_STATIC,
+              protocol: input.protocol || ProxyProtocol.HTTP,
+              services: input.services || [],
+            })),
+          });
+        }
+      }
+
+      // Batch create new proxies
+      if (toCreate.length > 0) {
+        await this.fastify.prisma.proxy.createMany({
+          data: toCreate,
+        });
+      }
+    } catch (error) {
+      // If batch operation fails, report error
+      results.errors.push(`Batch operation failed: ${(error as Error).message}`);
+      // Reset counts since operation failed
+      results.created = 0;
+      results.restored = 0;
+      results.replaced = 0;
     }
 
     return results;
@@ -158,8 +303,10 @@ export class ProxyServiceClass {
     const limit = query.limit || 10;
     const skip = (page - 1) * limit;
 
-    // Build where clause
-    const where: Prisma.ProxyWhereInput = {};
+    // Build where clause - exclude soft deleted by default
+    const where: Prisma.ProxyWhereInput = {
+      deletedAt: null,
+    };
 
     if (query.search) {
       where.ip = { contains: query.search, mode: 'insensitive' };
@@ -264,9 +411,128 @@ export class ProxyServiceClass {
   }
 
   /**
-   * Delete proxy
+   * Soft delete proxy
    */
   async deleteProxy(id: string) {
+    // Check if proxy exists and not already deleted
+    const existingProxy = await this.fastify.prisma.proxy.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!existingProxy) {
+      throw this.fastify.httpErrors.notFound('Proxy not found');
+    }
+
+    await this.fastify.prisma.proxy.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
+  }
+
+  /**
+   * Bulk soft delete proxies
+   */
+  async bulkDeleteProxies(ids: string[]) {
+    const result = await this.fastify.prisma.proxy.updateMany({
+      where: { id: { in: ids }, deletedAt: null },
+      data: { deletedAt: new Date() },
+    });
+
+    return { deleted: result.count };
+  }
+
+  /**
+   * Get deleted proxies (trash)
+   */
+  async getDeletedProxies(query: ProxyQueryInput) {
+    const page = query.page || 1;
+    const limit = query.limit || 10;
+    const skip = (page - 1) * limit;
+
+    // Build where clause - only soft deleted
+    const where: Prisma.ProxyWhereInput = {
+      deletedAt: { not: null },
+    };
+
+    if (query.search) {
+      where.ip = { contains: query.search, mode: 'insensitive' };
+    }
+
+    if (query.type) {
+      where.type = query.type;
+    }
+
+    if (query.status) {
+      where.status = query.status;
+    }
+
+    // Get total count
+    const total = await this.fastify.prisma.proxy.count({ where });
+
+    // Get proxies with sorting
+    const orderBy: Prisma.ProxyOrderByWithRelationInput = {};
+    const sortBy = query.sortBy || 'deletedAt';
+    const sortOrder = query.sortOrder || 'desc';
+
+    if (sortBy === 'deletedAt') {
+      orderBy.deletedAt = sortOrder;
+    } else {
+      orderBy[sortBy] = sortOrder;
+    }
+
+    const proxies = await this.fastify.prisma.proxy.findMany({
+      skip,
+      take: limit,
+      where,
+      orderBy,
+    });
+
+    return {
+      data: proxies,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  /**
+   * Restore soft deleted proxy
+   */
+  async restoreProxy(id: string) {
+    // Check if proxy exists and is deleted
+    const existingProxy = await this.fastify.prisma.proxy.findFirst({
+      where: { id, deletedAt: { not: null } },
+    });
+    if (!existingProxy) {
+      throw this.fastify.httpErrors.notFound('Deleted proxy not found');
+    }
+
+    const proxy = await this.fastify.prisma.proxy.update({
+      where: { id },
+      data: { deletedAt: null },
+    });
+
+    return proxy;
+  }
+
+  /**
+   * Bulk restore soft deleted proxies
+   */
+  async bulkRestoreProxies(ids: string[]) {
+    const result = await this.fastify.prisma.proxy.updateMany({
+      where: { id: { in: ids }, deletedAt: { not: null } },
+      data: { deletedAt: null },
+    });
+
+    return { restored: result.count };
+  }
+
+  /**
+   * Permanently delete proxy
+   */
+  async permanentDeleteProxy(id: string) {
     // Check if proxy exists
     const existingProxy = await this.fastify.prisma.proxy.findUnique({
       where: { id },
@@ -281,11 +547,22 @@ export class ProxyServiceClass {
   }
 
   /**
-   * Bulk delete proxies
+   * Bulk permanent delete proxies
    */
-  async bulkDeleteProxies(ids: string[]) {
+  async bulkPermanentDeleteProxies(ids: string[]) {
     const result = await this.fastify.prisma.proxy.deleteMany({
       where: { id: { in: ids } },
+    });
+
+    return { deleted: result.count };
+  }
+
+  /**
+   * Empty trash (permanent delete all soft deleted)
+   */
+  async emptyTrash() {
+    const result = await this.fastify.prisma.proxy.deleteMany({
+      where: { deletedAt: { not: null } },
     });
 
     return { deleted: result.count };

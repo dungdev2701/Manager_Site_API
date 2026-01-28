@@ -167,10 +167,25 @@ export class WebsiteService {
     const existingWebsites = await this.websiteRepository.findManyByDomains(
       domains
     );
-    const existingDomains = new Set(existingWebsites.map((w) => w.domain));
+    const existingDomainsMap = new Map(existingWebsites.map((w) => [w.domain, w]));
 
-    // 3. Lọc ra domains mới (in-memory operation)
-    const newDomains = domains.filter((d) => !existingDomains.has(d));
+    // 3. Phân loại: domains mới vs domains cần merge types
+    const newDomains = domains.filter((d) => !existingDomainsMap.has(d));
+    const domainsToMergeTypes: Array<{ domain: string; newTypes: WebsiteType[] }> = [];
+
+    for (const [domain, existingWebsite] of existingDomainsMap) {
+      // Tìm types mới chưa có trong website hiện tại
+      // Handle null/undefined types
+      const currentTypes = existingWebsite.types || [];
+      const existingTypes = new Set(currentTypes);
+      const typesToAdd = types.filter(t => !existingTypes.has(t));
+
+      if (typesToAdd.length > 0) {
+        // Merge types: giữ types cũ + thêm types mới
+        const mergedTypes = [...currentTypes, ...typesToAdd];
+        domainsToMergeTypes.push({ domain, newTypes: mergedTypes });
+      }
+    }
 
     // 4. Bulk insert new domains (1 query thay vì N queries)
     let created = 0;
@@ -185,11 +200,27 @@ export class WebsiteService {
       created = await this.websiteRepository.createMany(createData);
     }
 
-    // 5. Return kết quả
+    // 5. Bulk update existing domains to merge types
+    let updated = 0;
+    if (domainsToMergeTypes.length > 0) {
+      const updateData = domainsToMergeTypes.map((item) => ({
+        domain: item.domain,
+        types: item.newTypes,
+      }));
+
+      updated = await this.websiteRepository.updateManyByDomain(updateData);
+    }
+
+    // 6. Return kết quả
+    const skippedCount = existingDomainsMap.size - domainsToMergeTypes.length;
     return {
       created,
-      updated: 0, // Function này không update existing
-      duplicates: Array.from(existingDomains),
+      updated,
+      duplicates: skippedCount > 0
+        ? Array.from(existingDomainsMap.keys()).filter(d =>
+            !domainsToMergeTypes.some(m => m.domain === d)
+          )
+        : [],
       invalid,
       total: input.domains.length,
     };
@@ -249,11 +280,43 @@ export class WebsiteService {
     // 2. Check domains nào đã tồn tại trong DB
     const domains = uniqueWebsites.map((w) => w.domain);
     const existingWebsites = await this.websiteRepository.findManyByDomains(domains);
-    const existingDomains = new Set(existingWebsites.map((w) => w.domain));
+    const existingDomainsMap = new Map(existingWebsites.map((w) => [w.domain, w]));
 
     // 3. Phân loại websites: mới vs đã tồn tại
-    const newWebsites = uniqueWebsites.filter((w) => !existingDomains.has(w.domain));
-    const websitesToUpdate = uniqueWebsites.filter((w) => existingDomains.has(w.domain));
+    const newWebsites = uniqueWebsites.filter((w) => !existingDomainsMap.has(w.domain));
+    const websitesToUpdate: Array<{
+      domain: string;
+      types?: WebsiteType[];
+      status?: WebsiteStatus;
+      metrics?: Prisma.InputJsonValue;
+    }> = [];
+
+    // Merge types cho websites đã tồn tại
+    for (const inputWebsite of uniqueWebsites) {
+      const existingWebsite = existingDomainsMap.get(inputWebsite.domain);
+      if (existingWebsite) {
+        const inputTypes = inputWebsite.types || [WebsiteType.ENTITY];
+        // Handle null/undefined types
+        const currentTypes = existingWebsite.types || [];
+        const existingTypes = new Set(currentTypes);
+
+        // Merge types: giữ types cũ + thêm types mới
+        const typesToAdd = inputTypes.filter(t => !existingTypes.has(t));
+        const mergedTypes = typesToAdd.length > 0
+          ? [...currentTypes, ...typesToAdd]
+          : undefined; // Không cần update nếu không có types mới
+
+        // Chỉ update nếu có gì thay đổi (types mới, status, hoặc metrics)
+        if (mergedTypes || inputWebsite.status || inputWebsite.metrics) {
+          websitesToUpdate.push({
+            domain: inputWebsite.domain,
+            types: mergedTypes,
+            status: inputWebsite.status,
+            metrics: inputWebsite.metrics as Prisma.InputJsonValue | undefined,
+          });
+        }
+      }
+    }
 
     // 4. Bulk insert new websites với metrics
     let created = 0;
@@ -269,24 +332,22 @@ export class WebsiteService {
       created = await this.websiteRepository.createMany(createData);
     }
 
-    // 5. Bulk update existing websites với metrics mới
+    // 5. Bulk update existing websites (merge types + update metrics)
     let updated = 0;
     if (websitesToUpdate.length > 0) {
-      const updateData = websitesToUpdate.map((website) => ({
-        domain: website.domain,
-        types: website.types,
-        status: website.status,
-        metrics: website.metrics as Prisma.InputJsonValue | undefined,
-      }));
-
-      updated = await this.websiteRepository.updateManyByDomain(updateData);
+      updated = await this.websiteRepository.updateManyByDomain(websitesToUpdate);
     }
 
     // 6. Return kết quả
+    const skippedCount = existingDomainsMap.size - websitesToUpdate.length;
     return {
       created,
       updated,
-      duplicates: Array.from(existingDomains), // Giữ lại để frontend biết domains nào đã được update
+      duplicates: skippedCount > 0
+        ? Array.from(existingDomainsMap.keys()).filter(d =>
+            !websitesToUpdate.some(w => w.domain === d)
+          )
+        : [],
       invalid,
       total: input.websites.length,
     };
@@ -424,8 +485,8 @@ export class WebsiteService {
     // Update với checkerId tracking
     const updated = await this.websiteRepository.update(id, updateData, userId);
 
-    // Log the change to AuditLog
-    await this.auditLogService.logWebsiteUpdate(
+    // Log the change to AuditLog (fire-and-forget for better performance)
+    this.auditLogService.logWebsiteUpdate(
       id,
       {
         types: oldWebsite.types,
@@ -442,7 +503,10 @@ export class WebsiteService {
       userId,
       requestInfo?.ipAddress,
       requestInfo?.userAgent
-    );
+    ).catch((err) => {
+      // Log error but don't fail the request
+      this.fastify.log.error({ err }, 'Failed to log website update to audit log');
+    });
 
     return updated;
   }

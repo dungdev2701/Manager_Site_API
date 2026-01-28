@@ -74,18 +74,22 @@ export class ProxyCheckerService {
     }
 
     // Reset any stuck CHECKING status from previous runs
-    // Only reset proxies that will be checked (or all if checking all)
+    // Only reset proxies that will be checked (or all non-deleted if checking all)
     await this.fastify.prisma.proxy.updateMany({
       where: {
         status: ProxyStatus.CHECKING,
+        deletedAt: null,
         ...(proxyIds.length > 0 ? { id: { in: proxyIds } } : {}),
       },
       data: { status: ProxyStatus.UNKNOWN },
     });
 
-    // Get proxies to check
+    // Get proxies to check (only non-deleted proxies)
     const proxies = await this.fastify.prisma.proxy.findMany({
-      where: proxyIds.length > 0 ? { id: { in: proxyIds } } : {},
+      where: {
+        deletedAt: null,
+        ...(proxyIds.length > 0 ? { id: { in: proxyIds } } : {}),
+      },
       select: {
         id: true,
         ip: true,

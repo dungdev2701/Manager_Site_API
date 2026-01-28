@@ -29,6 +29,9 @@ function buildApiKeyMap(): ApiKeyTypeMap {
   if (config.apiKeys.GG_STACKING) {
     map[config.apiKeys.GG_STACKING] = WebsiteType.GG_STACKING;
   }
+  if (config.apiKeys.ENTITY_SOCIAL) {
+    map[config.apiKeys.ENTITY_SOCIAL] = WebsiteType.ENTITY_SOCIAL;
+  }
 
   return map;
 }

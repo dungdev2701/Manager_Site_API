@@ -3,7 +3,7 @@ import { z } from 'zod';
 /**
  * Enum cho loại website
  */
-export const websiteTypeEnum = z.enum(['ENTITY', 'BLOG2', 'PODCAST', 'SOCIAL', 'GG_STACKING']);
+export const websiteTypeEnum = z.enum(['ENTITY', 'BLOG2', 'PODCAST', 'SOCIAL', 'GG_STACKING', 'ENTITY_SOCIAL']);
 
 /**
  * Schema cho metrics của website

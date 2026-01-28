@@ -236,4 +236,112 @@ export class ProxyController {
 
     return ResponseHelper.success(reply, result, 'Check stopped');
   }
+
+  /**
+   * Get deleted proxies (trash)
+   * GET /proxies/trash
+   */
+  static async getTrash(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const query: ProxyQueryDTO = proxyQuerySchema.parse(request.query);
+
+    const proxyService = new ProxyServiceClass(request.server);
+    const result = await proxyService.getDeletedProxies({
+      page: query.page,
+      limit: query.limit,
+      search: query.search,
+      type: query.type,
+      status: query.status,
+      sortBy: query.sortBy as 'ip' | 'createdAt' | 'status' | 'type' | 'responseTime' | 'lastCheckedAt' | undefined,
+      sortOrder: query.sortOrder as 'asc' | 'desc' | undefined,
+    });
+
+    return ResponseHelper.success(reply, result);
+  }
+
+  /**
+   * Restore deleted proxy
+   * POST /proxies/restore/:id
+   */
+  static async restore(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { id } = request.params as { id: string };
+
+    const proxyService = new ProxyServiceClass(request.server);
+    const proxy = await proxyService.restoreProxy(id);
+
+    return ResponseHelper.success(reply, proxy, 'Proxy restored successfully');
+  }
+
+  /**
+   * Bulk restore deleted proxies
+   * POST /proxies/bulk-restore
+   */
+  static async bulkRestore(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const validatedData = bulkDeleteProxySchema.parse(request.body);
+
+    const proxyService = new ProxyServiceClass(request.server);
+    const result = await proxyService.bulkRestoreProxies(validatedData.ids);
+
+    return ResponseHelper.success(reply, result, 'Proxies restored successfully');
+  }
+
+  /**
+   * Permanently delete proxy
+   * DELETE /proxies/permanent-delete/:id
+   */
+  static async permanentDelete(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { id } = request.params as { id: string };
+
+    const proxyService = new ProxyServiceClass(request.server);
+    await proxyService.permanentDeleteProxy(id);
+
+    return ResponseHelper.success(reply, null, 'Proxy permanently deleted');
+  }
+
+  /**
+   * Bulk permanent delete proxies
+   * POST /proxies/bulk-permanent-delete
+   */
+  static async bulkPermanentDelete(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const validatedData = bulkDeleteProxySchema.parse(request.body);
+
+    const proxyService = new ProxyServiceClass(request.server);
+    const result = await proxyService.bulkPermanentDeleteProxies(validatedData.ids);
+
+    return ResponseHelper.success(reply, result, 'Proxies permanently deleted');
+  }
+
+  /**
+   * Empty trash (permanently delete all deleted proxies)
+   * POST /proxies/empty-trash
+   */
+  static async emptyTrash(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const proxyService = new ProxyServiceClass(request.server);
+    const result = await proxyService.emptyTrash();
+
+    return ResponseHelper.success(reply, result, 'Trash emptied successfully');
+  }
 }

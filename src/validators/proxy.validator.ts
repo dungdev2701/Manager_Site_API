@@ -24,6 +24,7 @@ export const bulkCreateProxySchema = z.object({
   type: z.nativeEnum(ProxyType).optional().default(ProxyType.IPV4_STATIC),
   protocol: z.nativeEnum(ProxyProtocol).optional().default(ProxyProtocol.HTTP),
   services: z.array(z.nativeEnum(ProxyServiceType)).optional().default([]),
+  handleTrashed: z.enum(['restore', 'replace']).optional(),
 });
 
 /**

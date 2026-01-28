@@ -1,5 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { GmailStatus, Prisma } from '@prisma/client';
+import Imap = require('imap');
 
 export interface CreateGmailInput {
   email: string;
@@ -424,6 +425,100 @@ export class GmailService {
     return {
       claimed: gmails.length,
       newOwnerAssigned: neverUsedIds.length,
+    };
+  }
+
+  /**
+   * Check if email can receive mail using IMAP with app password
+   * Connects to Gmail IMAP server to verify credentials
+   */
+  async checkEmailCanReceive(
+    email: string,
+    appPassword: string
+  ): Promise<{ success: boolean; message: string }> {
+    return new Promise((resolve) => {
+      const imap = new Imap({
+        user: email,
+        password: appPassword.replace(/\s/g, ''), // Remove spaces from app password
+        host: 'imap.gmail.com',
+        port: 993,
+        tls: true,
+        tlsOptions: { rejectUnauthorized: false },
+        connTimeout: 10000, // 10 seconds
+        authTimeout: 10000,
+      });
+
+      const timeout = setTimeout(() => {
+        try {
+          imap.end();
+        } catch {
+          // Ignore
+        }
+        resolve({ success: false, message: 'Connection timeout' });
+      }, 15000); // 15 seconds total timeout
+
+      imap.once('ready', () => {
+        clearTimeout(timeout);
+        imap.end();
+        resolve({ success: true, message: 'Email can receive mail' });
+      });
+
+      imap.once('error', (err: Error) => {
+        clearTimeout(timeout);
+        try {
+          imap.end();
+        } catch {
+          // Ignore
+        }
+
+        // Parse error message
+        let message = 'Cannot connect to email';
+        if (err.message.includes('Invalid credentials')) {
+          message = 'Invalid email or app password';
+        } else if (err.message.includes('AUTHENTICATIONFAILED')) {
+          message = 'Authentication failed - check app password';
+        } else if (err.message.includes('Too many')) {
+          message = 'Too many login attempts, try again later';
+        } else if (err.message.includes('ETIMEDOUT') || err.message.includes('timeout')) {
+          message = 'Connection timeout';
+        }
+
+        resolve({ success: false, message });
+      });
+
+      imap.once('end', () => {
+        clearTimeout(timeout);
+      });
+
+      try {
+        imap.connect();
+      } catch (err) {
+        clearTimeout(timeout);
+        resolve({ success: false, message: 'Failed to initiate connection' });
+      }
+    });
+  }
+
+  /**
+   * Check email and update status in database
+   */
+  async checkEmailAndUpdateStatus(
+    gmailId: string,
+    email: string,
+    appPassword: string
+  ) {
+    const result = await this.checkEmailCanReceive(email, appPassword);
+
+    // Update status in database
+    const newStatus = result.success ? GmailStatus.SUCCESS : GmailStatus.FAILED;
+    await this.fastify.prisma.gmail.update({
+      where: { id: gmailId },
+      data: { status: newStatus },
+    });
+
+    return {
+      ...result,
+      status: newStatus,
     };
   }
 }

@@ -208,4 +208,116 @@ export class GmailController {
 
     return ResponseHelper.success(reply, result);
   }
+
+  /**
+   * Check if email can receive mail (using IMAP with app password)
+   * POST /gmails/check-email
+   */
+  static async checkEmail(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { id } = request.body as { id: string };
+
+    if (!id) {
+      return ResponseHelper.badRequest(reply, 'id is required');
+    }
+
+    const gmailService = new GmailService(request.server);
+
+    // Get gmail by id
+    const gmail = await gmailService.getGmailById(id);
+    if (!gmail) {
+      return ResponseHelper.notFound(reply, 'Gmail not found');
+    }
+
+    if (!gmail.appPassword) {
+      return ResponseHelper.badRequest(reply, 'Gmail does not have an app password');
+    }
+
+    // Check email and update status
+    const result = await gmailService.checkEmailAndUpdateStatus(
+      gmail.id,
+      gmail.email,
+      gmail.appPassword
+    );
+
+    return ResponseHelper.success(reply, result);
+  }
+
+  /**
+   * Check multiple emails (max 10 at a time)
+   * POST /gmails/check-emails
+   */
+  static async checkEmails(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { ids } = request.body as { ids: string[] };
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return ResponseHelper.badRequest(reply, 'ids must be a non-empty array');
+    }
+
+    if (ids.length > 10) {
+      return ResponseHelper.badRequest(reply, 'Maximum 10 emails can be checked at once');
+    }
+
+    const gmailService = new GmailService(request.server);
+    const results: Array<{
+      id: string;
+      email: string;
+      success: boolean;
+      message: string;
+      status: string;
+    }> = [];
+
+    // Get all gmails
+    const gmails = await request.server.prisma.gmail.findMany({
+      where: {
+        id: { in: ids },
+        deletedAt: null,
+      },
+    });
+
+    // Check each email sequentially to avoid rate limiting
+    for (const gmail of gmails) {
+      if (!gmail.appPassword) {
+        results.push({
+          id: gmail.id,
+          email: gmail.email,
+          success: false,
+          message: 'No app password',
+          status: 'FAILED',
+        });
+        continue;
+      }
+
+      const result = await gmailService.checkEmailAndUpdateStatus(
+        gmail.id,
+        gmail.email,
+        gmail.appPassword
+      );
+
+      results.push({
+        id: gmail.id,
+        email: gmail.email,
+        ...result,
+      });
+    }
+
+    const successCount = results.filter((r) => r.success).length;
+    const failCount = results.filter((r) => !r.success).length;
+
+    return ResponseHelper.success(reply, {
+      results,
+      summary: {
+        total: results.length,
+        success: successCount,
+        failed: failCount,
+      },
+    });
+  }
 }

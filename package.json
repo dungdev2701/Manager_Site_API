@@ -37,6 +37,7 @@
         "fastify": "^5.0.0",
         "fastify-cli": "^7.3.0",
         "fastify-plugin": "^5.0.0",
+        "imap": "0.8.19",
         "lodash": "^4.17.21",
         "luxon": "^3.5.0",
         "mysql2": "3.16.0",
@@ -50,6 +51,7 @@
     "devDependencies": {
         "@types/bcrypt": "^5.0.2",
         "@types/bcryptjs": "3.0.0",
+        "@types/imap": "0.8.43",
         "@types/lodash": "^4.17.16",
         "@types/luxon": "^3.4.2",
         "@types/node": "^22.1.0",

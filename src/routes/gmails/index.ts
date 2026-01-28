@@ -38,6 +38,12 @@ const gmailRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
 
   // POST /gmails/check-usage - Check usage status (does NOT create records)
   fastify.post('/check-usage', { preHandler: authPreHandler }, GmailController.checkUsage);
+
+  // POST /gmails/check-email - Check single email can receive mail
+  fastify.post('/check-email', { preHandler: authPreHandler }, GmailController.checkEmail);
+
+  // POST /gmails/check-emails - Check multiple emails (max 10)
+  fastify.post('/check-emails', { preHandler: authPreHandler }, GmailController.checkEmails);
 };
 
 export default gmailRoutes;

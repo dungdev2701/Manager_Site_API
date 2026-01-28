@@ -52,6 +52,7 @@ export class WebsiteRepository {
       select: {
         id: true,
         domain: true,
+        types: true, // Include types for merge logic
         status: true,
         createdAt: true,
       },

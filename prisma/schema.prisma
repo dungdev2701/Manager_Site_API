@@ -104,6 +104,7 @@ enum WebsiteType {
   PODCAST       // Podcast
   SOCIAL        // Social
   GG_STACKING   // GG Stacking
+  ENTITY_SOCIAL // Entity Social
 }
 
 enum CheckType {
@@ -546,8 +547,10 @@ model Proxy {
   // Timestamps
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
+  deletedAt       DateTime?       @map("deleted_at")
 
   @@unique([ip, port])
+  @@index([deletedAt])
   @@index([type])
   @@index([protocol])
   @@index([status])

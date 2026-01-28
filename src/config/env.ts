@@ -43,6 +43,10 @@ const envSchema = z.object({
   API_KEY_PODCAST: z.string().min(16).optional(),
   API_KEY_SOCIAL: z.string().min(16).optional(),
   API_KEY_GG_STACKING: z.string().min(16).optional(),
+  API_KEY_ENTITY_SOCIAL: z.string().min(16).optional(),
+
+  // Monitor Service API Key
+  API_KEY_MONITOR: z.string().min(16).optional(),
 });
 
 type Env = z.infer<typeof envSchema>;
@@ -105,5 +109,9 @@ export const config = {
     PODCAST: parsedEnv.API_KEY_PODCAST,
     SOCIAL: parsedEnv.API_KEY_SOCIAL,
     GG_STACKING: parsedEnv.API_KEY_GG_STACKING,
+    ENTITY_SOCIAL: parsedEnv.API_KEY_ENTITY_SOCIAL,
   },
+
+  // Monitor Service API Key
+  monitorApiKey: parsedEnv.API_KEY_MONITOR,
 } as const;
