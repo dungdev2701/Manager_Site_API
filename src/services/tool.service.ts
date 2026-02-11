@@ -357,14 +357,15 @@ export class ToolServiceClass {
 
     // Step 2: Find and mark stale tools using raw SQL for optimal performance
     // This uses database-level date arithmetic instead of loading all tools into memory
+    // Note: Table name is "tools" (from @@map("tools") in schema)
     const staleTools = await this.fastify.prisma.$queryRaw<
-      Array<{ id: string; idTool: string; updatedAt: Date; estimateTime: number }>
+      Array<{ id: string; id_tool: string; updatedAt: Date; estimate_time: number }>
     >`
-      SELECT id, "idTool", "updatedAt", COALESCE("estimateTime", ${DEFAULT_ESTIMATE_TIME}) as "estimateTime"
-      FROM "Tool"
+      SELECT id, id_tool, "updatedAt", COALESCE(estimate_time, ${DEFAULT_ESTIMATE_TIME}) as estimate_time
+      FROM tools
       WHERE "deletedAt" IS NULL
         AND status = 'RUNNING'
-        AND "updatedAt" < NOW() - (COALESCE("estimateTime", ${DEFAULT_ESTIMATE_TIME}) * INTERVAL '1 minute')
+        AND "updatedAt" < NOW() - (COALESCE(estimate_time, ${DEFAULT_ESTIMATE_TIME}) * INTERVAL '1 minute')
       LIMIT 1000
     `;
 
@@ -392,9 +393,9 @@ export class ToolServiceClass {
       markedCount: staleTools.length,
       tools: staleTools.map((t) => ({
         id: t.id,
-        idTool: t.idTool,
+        idTool: t.id_tool,
         lastUpdated: t.updatedAt,
-        estimateTime: t.estimateTime,
+        estimateTime: t.estimate_time,
       })),
       estimateTimeUpdated: estimateTimeUpdateResult.count,
     };

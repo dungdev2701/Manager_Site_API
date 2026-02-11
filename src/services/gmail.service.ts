@@ -430,7 +430,7 @@ export class GmailService {
 
   /**
    * Check if email can receive mail using IMAP with app password
-   * Connects to Gmail IMAP server to verify credentials
+   * Connects to Gmail IMAP server, opens INBOX to verify email can actually receive mail
    */
   async checkEmailCanReceive(
     email: string,
@@ -448,28 +448,47 @@ export class GmailService {
         authTimeout: 10000,
       });
 
-      const timeout = setTimeout(() => {
-        try {
-          imap.end();
-        } catch {
-          // Ignore
+      let resolved = false;
+      const safeResolve = (result: { success: boolean; message: string }) => {
+        if (!resolved) {
+          resolved = true;
+          try {
+            imap.end();
+          } catch {
+            // Ignore
+          }
+          resolve(result);
         }
-        resolve({ success: false, message: 'Connection timeout' });
-      }, 15000); // 15 seconds total timeout
+      };
+
+      const timeout = setTimeout(() => {
+        safeResolve({ success: false, message: 'Connection timeout' });
+      }, 20000); // 20 seconds total timeout
 
       imap.once('ready', () => {
-        clearTimeout(timeout);
-        imap.end();
-        resolve({ success: true, message: 'Email can receive mail' });
+        // After connection is ready, try to open INBOX to verify email can receive mail
+        imap.openBox('INBOX', true, (err, box) => {
+          clearTimeout(timeout);
+          if (err) {
+            // Failed to open INBOX - email cannot receive mail
+            let message = 'Cannot access INBOX';
+            if (err.message.includes('NONEXISTENT')) {
+              message = 'INBOX does not exist';
+            } else if (err.message.includes('denied') || err.message.includes('permission')) {
+              message = 'Access to INBOX denied';
+            } else if (err.message.includes('disabled')) {
+              message = 'IMAP access is disabled for this account';
+            }
+            safeResolve({ success: false, message });
+          } else {
+            // Successfully opened INBOX - email can receive mail
+            safeResolve({ success: true, message: `Email can receive mail (${box.messages.total} messages in INBOX)` });
+          }
+        });
       });
 
       imap.once('error', (err: Error) => {
         clearTimeout(timeout);
-        try {
-          imap.end();
-        } catch {
-          // Ignore
-        }
 
         // Parse error message
         let message = 'Cannot connect to email';
@@ -481,9 +500,13 @@ export class GmailService {
           message = 'Too many login attempts, try again later';
         } else if (err.message.includes('ETIMEDOUT') || err.message.includes('timeout')) {
           message = 'Connection timeout';
+        } else if (err.message.includes('Web login required')) {
+          message = 'Web login required - account may need verification';
+        } else if (err.message.includes('disabled')) {
+          message = 'IMAP access is disabled for this account';
         }
 
-        resolve({ success: false, message });
+        safeResolve({ success: false, message });
       });
 
       imap.once('end', () => {
@@ -494,7 +517,7 @@ export class GmailService {
         imap.connect();
       } catch (err) {
         clearTimeout(timeout);
-        resolve({ success: false, message: 'Failed to initiate connection' });
+        safeResolve({ success: false, message: 'Failed to initiate connection' });
       }
     });
   }

@@ -27,6 +27,7 @@ model User {
   gmails           Gmail[]
   gmailUsages      GmailUsage[]
   tools            Tool[]
+  assignedRequests ServiceRequest[]
 
   @@map("users")
 }
@@ -250,11 +251,111 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+// ==================== SERVICE REQUEST ====================
+// Bảng gộp chung request của tất cả dịch vụ (Entity, Blog2, Podcast, Social, GG Stacking)
+// Website KH gọi API insert vào bảng này, hệ thống sẽ tự động phân bổ
+model ServiceRequest {
+  id              String              @id @default(uuid())
+
+  // External user (từ website KH - không có FK, vì user KH nằm ở hệ thống khác)
+  externalUserId    String                              // ID user từ hệ thống KH
+  externalUserEmail String?                             // Email user KH (để hiển thị)
+  externalUserName  String?                             // Tên user KH (để hiển thị)
+
+  // Internal user (nhân viên nội bộ Manager Site được gán xử lý)
+  assignedUserId  String?
+  assignedUser    User?               @relation(fields: [assignedUserId], references: [id])
+
+  // Service identification
+  serviceType     ServiceType                         // Loại dịch vụ
+  serviceGroupId  String?                             // Liên kết Group bên website KH (socialGroupId, blogGroupId, podcastGroupId)
+  externalId      String?                             // ID gốc của request bên website KH (để đồng bộ)
+
+  // Tool assignment
+  idTool          String?                             // Tool pair được phân bổ (e.g. "Normal 1;Captcha 1")
+
+  // Request info
+  name            String?
+  typeRequest     String?                             // Loại request (post, register, ...)
+  target          String?             @db.Text        // Mục tiêu / URL target
+  auctionPrice    Decimal?            @db.Decimal(10, 2)
+
+  // Status
+  status          RequestStatus       @default(NEW)
+
+  // Config riêng theo từng serviceType (lưu dưới dạng JSON)
+  // Entity: { email, appPassword, username, entityLimit, accountType, spinContent, entityConnect, socialConnect, firstName, lastName, about, address, phone, location, website, fixedSites, avatar, cover }
+  // Blog2:  { data }
+  // Social: { data }
+  // Podcast: { data }
+  // GG Stacking: { folderUrl, title, website, about, phone, address, location, stackingConnect, spinContent, duplicate }
+  config          Json?               @db.JsonB
+
+  // Progress tracking
+  totalLinks      Int                 @default(0)
+  completedLinks  Int                 @default(0)
+  failedLinks     Int                 @default(0)
+  progressPercent Decimal             @default(0) @db.Decimal(5, 2)
+
+  // Domain selection
+  domains         DomainSelection     @default(LIKEPION)
+
+  // Retry & run tracking
+  retryCount      Int                 @default(0)
+  runCount        Int                 @default(0)
+
+  // Timestamps
+  checkedAt       DateTime?
+  deletedAt       DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  // Relations
+  batches         AllocationBatch[]
+  allocationItems AllocationItem[]
+
+  @@index([status, serviceType])
+  @@index([serviceType, deletedAt])
+  @@index([externalUserId])
+  @@index([assignedUserId])
+  @@index([idTool])
+  @@index([externalId, serviceType])
+  @@index([status, deletedAt])
+  @@index([createdAt])
+  @@map("service_requests")
+}
+
+enum ServiceType {
+  ENTITY
+  BLOG2
+  PODCAST
+  SOCIAL
+  GG_STACKING
+}
+
+enum RequestStatus {
+  DRAFT         // KH tạo nhưng chưa gửi
+  NEW           // KH vừa gửi, chờ hệ thống xử lý
+  PENDING       // Đang chờ phân bổ website
+  RUNNING       // Đã phân bổ, tool đang xử lý
+  CONNECTING    // Tool đang kết nối/đăng ký
+  COMPLETED     // Hoàn thành
+  CANCEL        // Đã hủy
+}
+
+enum DomainSelection {
+  LIKEPION
+  LINKSBUFF
+  ALL
+  CUSTOM
+}
+
 // ==================== WEBSITE ALLOCATION ====================
-// Batch phân bổ website cho mỗi entity_request từ MySQL
+// Batch phân bổ website cho mỗi ServiceRequest
 model AllocationBatch {
   id                  String              @id @default(uuid())
-  externalRequestId   String              // ID của entity_request bên MySQL
+  requestId           String?             // FK đến ServiceRequest
+  externalRequestId   String?             // Legacy: ID của entity_request bên MySQL (sẽ bỏ sau khi migrate xong)
   batchNumber         Int                 // Số thứ tự batch (1, 2, 3...)
 
   // Allocation info
@@ -274,9 +375,11 @@ model AllocationBatch {
   updatedAt           DateTime            @updatedAt
 
   // Relations
+  request             ServiceRequest?     @relation(fields: [requestId], references: [id])
   items               AllocationItem[]
 
   @@unique([externalRequestId, batchNumber])
+  @@index([requestId])
   @@index([externalRequestId])
   @@index([status])
   @@index([createdAt])
@@ -290,36 +393,72 @@ enum AllocationBatchStatus {
   FAILED      // Thất bại
 }
 
-// Chi tiết từng website được phân bổ
+// Chi tiết từng website được phân bổ + thông tin link (gộp vai trò entity_link, blog2_link, social_link...)
 model AllocationItem {
   id              String              @id @default(uuid())
   batchId         String
+  requestId       String?             // FK đến ServiceRequest (denormalized for performance)
   websiteId       String
-  domain          String              // Lưu domain để dễ insert vào MySQL entity_link
+  domain          String              // Domain website được phân bổ
+
+  // Service type
+  serviceType     ServiceType         // Loại dịch vụ (ENTITY, BLOG2, SOCIAL, PODCAST, GG_STACKING)
 
   // Allocation tracking
   trafficType     TrafficType         // HIGH hoặc LOW
   priorityScore   Float               @default(0) // Score dùng để sort (based on success rate)
 
-  // Result tracking (sync từ entity_link)
-  status          AllocationItemStatus @default(PENDING)
-  resultSyncedAt  DateTime?           // Khi sync kết quả từ MySQL
+  // Link info (tương ứng entity_link, blog2_link, social_link... bên MySQL)
+  externalLinkId  String?             // ID của link bên MySQL (entity_link.id, blog2_link.id...)
 
-  // Error info (if failed)
+  // Tool claim info
+  claimedBy       String?             // Tool ID đã claim task này (id_tool)
+  claimedAt       DateTime?           // Thời điểm claim
+  claimTimeout    Int                 @default(5) // Timeout phút, sau đó task được release
+
+  // Dữ liệu riêng theo từng serviceType (lưu dưới dạng JSONB)
+  // Entity: { email, username, password, about }
+  // Blog2:  { title, content, category, ... }
+  // Social: { profileName, bio, ... }
+  // Podcast: { channelName, description, ... }
+  linkData        Json?               @db.JsonB
+
+  // Kết quả từ tool (chung cho mọi service)
+  linkProfile     String?             // URL profile đã tạo
+  linkPost        String?             // URL bài đăng đã tạo
+
+  // Status & tracking
+  status          AllocationItemStatus @default(PENDING)
+  linkStatus      String?             // Status gốc từ MySQL (new, registering, profiling, finish, failed...)
+  retryIndex      Int                 @default(0) // Số lần retry (tương ứng entity_link.index)
+  note            String?             @db.Text  // Ghi chú / lỗi chi tiết
+
+  // Sync tracking
+  resultSyncedAt  DateTime?           // Lần cuối sync kết quả từ MySQL
+
+  // Error info
   errorCode       String?
   errorMessage    String?
 
+  // Timestamps
   allocatedAt     DateTime            @default(now())
   completedAt     DateTime?
 
   // Relations
   batch           AllocationBatch     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  request         ServiceRequest?     @relation(fields: [requestId], references: [id], onDelete: Cascade)
   website         Website             @relation(fields: [websiteId], references: [id], onDelete: Cascade)
 
   @@index([batchId])
+  @@index([requestId])
   @@index([websiteId])
   @@index([status])
+  @@index([serviceType])
   @@index([allocatedAt])
+  @@index([externalLinkId])
+  @@index([claimedBy])
+  @@index([claimedAt])
+  @@index([linkStatus])
   @@map("allocation_items")
 }
 
@@ -329,12 +468,24 @@ enum TrafficType {
 }
 
 enum AllocationItemStatus {
-  PENDING     // Đã phân bổ, chờ chạy
-  RUNNING     // Đang chạy
-  SUCCESS     // Thành công
-  FAILED      // Thất bại
+  NEW               // Mới tạo, chờ tool claim
+  REGISTERING       // Đang đăng ký tài khoản
+  PROFILING         // Đang tạo profile
+  CONNECT           // Chờ đủ điều kiện stacking (entityConnect=all/limit, đang chờ threshold)
+  CONNECTING        // Đang thực hiện stacking (tool có thể claim)
+  FAIL_REGISTERING  // Lỗi khi đăng ký
+  FAIL_PROFILING    // Lỗi khi tạo profile
+  FAIL_CONNECTING   // Lỗi khi kết nối
+  CANCEL            // Đã hủy
+  FINISH            // Hoàn thành
+
+  // Legacy statuses (backward compatible)
+  PENDING     // Deprecated - use NEW
+  CLAIMED     // Deprecated - use REGISTERING/PROFILING/CONNECTING
+  SUCCESS     // Deprecated - use FINISH
+  FAILED      // Deprecated - use FAIL_*
   SKIPPED     // Bỏ qua
-  CANCELLED   // Bị hủy (chưa chạy, không tính vào success rate)
+  CANCELLED   // Deprecated - use CANCEL
 }
 
 // ==================== DAILY ALLOCATION TRACKING ====================
@@ -586,4 +737,29 @@ enum ProxyServiceType {
   PODCAST         // Podcast
   SOCIAL          // Social
   GG_STACKING     // GG Stacking
+}
+
+// ==================== SYSTEM CONFIGURATION ====================
+// Lưu các config có thể điều chỉnh mà không cần sửa code
+model SystemConfig {
+  id          String    @id @default(uuid())
+  key         String    @unique // Key duy nhất, ví dụ: ALLOCATION_MULTIPLIER
+  value       String    // Giá trị (string, parse theo type khi dùng)
+  type        ConfigType @default(STRING) // Loại dữ liệu để parse
+  description String?   @db.Text // Mô tả config
+
+  // Metadata
+  updatedBy   String?   // User ID người cập nhật cuối
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([key])
+  @@map("system_configs")
+}
+
+enum ConfigType {
+  STRING
+  NUMBER
+  BOOLEAN
+  JSON
 }
