@@ -441,6 +441,31 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
   );
 
   /**
+   * GET /api/public/allocation-tasks/:itemId/link-profiles
+   *
+   * Lấy danh sách linkProfile của các task cùng request, loại trừ task hiện tại
+   * Tương đương MySQL: SELECT link_profile FROM entity_link
+   *   WHERE entityRequestId = :requestId AND link_profile != '' AND id != :itemId
+   *
+   * Query params:
+   * - requestId: Required - ID của request
+   *
+   * Response:
+   * {
+   *   "success": true,
+   *   "data": {
+   *     "linkProfiles": ["https://example.com/profile/1", "https://example.com/profile/2"],
+   *     "count": 2
+   *   }
+   * }
+   */
+  fastify.get(
+    '/allocation-tasks/:itemId/link-profiles',
+    { config: { rateLimit: TOOL_RATE_LIMIT } },
+    allocationController.getLinkProfiles.bind(allocationController)
+  );
+
+  /**
    * GET /api/public/allocation-tasks/pending
    *
    * Tools xem pending tasks (không claim)

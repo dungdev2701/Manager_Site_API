@@ -357,6 +357,44 @@ export class AllocationTaskController {
     });
   }
 
+  /**
+   * GET /allocation-tasks/:itemId/link-profiles
+   *
+   * Lấy danh sách linkProfile của các task cùng request, loại trừ task hiện tại
+   * Tương đương: SELECT link_profile FROM entity_link
+   *              WHERE entityRequestId = :requestId AND link_profile != '' AND id != :itemId
+   *
+   * Query: ?requestId=xxx (required)
+   */
+  async getLinkProfiles(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const params = request.params as { itemId: string };
+    const query = request.query as { requestId?: string; limit?: string };
+    const { itemId } = params;
+    const { requestId, limit } = query;
+
+    if (!requestId) {
+      reply.status(400).send({
+        success: false,
+        message: 'requestId query parameter is required',
+      });
+      return;
+    }
+
+    const parsedLimit = limit ? parseInt(limit, 10) : undefined;
+    const result = await this.allocationService.getLinkProfilesByRequest(requestId, itemId, parsedLimit);
+
+    reply.send({
+      success: true,
+      data: {
+        linkProfiles: result.linkProfiles,
+        count: result.count,
+      },
+    });
+  }
+
   // ==================== STATISTICS APIs ====================
 
   /**

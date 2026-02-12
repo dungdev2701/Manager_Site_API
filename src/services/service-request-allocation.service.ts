@@ -1744,6 +1744,46 @@ export class ServiceRequestAllocationService {
     return { count, items };
   }
 
+  // ==================== LINK PROFILE QUERIES ====================
+
+  /**
+   * Get linkProfile list for a request, excluding a specific item
+   *
+   * Equivalent to MySQL:
+   * SELECT link_profile FROM entity_link
+   * WHERE entityRequestId = :requestId
+   *   AND link_profile != ''
+   *   AND id != :excludeItemId
+   */
+  async getLinkProfilesByRequest(
+    requestId: string,
+    excludeItemId: string,
+    limit?: number
+  ): Promise<{ success: boolean; linkProfiles: string[]; count: number }> {
+    const items = await this.prisma.allocationItem.findMany({
+      where: {
+        requestId,
+        id: { not: excludeItemId },
+        linkProfile: { not: null },
+      },
+      select: {
+        linkProfile: true,
+      },
+      ...(limit && { take: limit }),
+    });
+
+    // Filter out empty strings
+    const linkProfiles = items
+      .map((i) => i.linkProfile!)
+      .filter((lp) => lp !== '');
+
+    return {
+      success: true,
+      linkProfiles,
+      count: linkProfiles.length,
+    };
+  }
+
   // ==================== PUBLIC API METHODS ====================
 
   /**
