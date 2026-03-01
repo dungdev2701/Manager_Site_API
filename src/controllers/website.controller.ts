@@ -13,7 +13,7 @@ import {
   UpdateWebsiteDTO,
   WebsiteQueryDTO,
 } from '../validators/website.validator';
-import { Role } from '@prisma/client';
+import { Role, WebsiteStatus } from '@prisma/client';
 
 export class WebsiteController {
   /**
@@ -297,6 +297,37 @@ export class WebsiteController {
   }
 
   /**
+   * Bulk update status cho nhiều websites
+   * PATCH /websites/bulk/status
+   * Permission: ADMIN, MANAGER
+   */
+  static async bulkUpdateStatus(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { ids, status } = request.body as { ids: string[]; status: string };
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return ResponseHelper.badRequest(reply, 'IDs array is required');
+    }
+
+    if (!status) {
+      return ResponseHelper.badRequest(reply, 'Status is required');
+    }
+
+    const validStatuses = ['NEW', 'CHECKING', 'HANDING', 'PENDING', 'RUNNING', 'ERROR', 'MAINTENANCE'];
+    if (!validStatuses.includes(status)) {
+      return ResponseHelper.badRequest(reply, `Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+    }
+
+    const websiteService = new WebsiteService(request.server);
+    const result = await websiteService.bulkUpdateStatus(ids, status as WebsiteStatus);
+
+    return ResponseHelper.success(reply, result, `Updated ${result.updated} websites`);
+  }
+
+  /**
    * Lấy tất cả website IDs dựa trên filter (để hỗ trợ Select All)
    * GET /websites/all-ids
    * Permission: ALL
@@ -352,5 +383,31 @@ export class WebsiteController {
     const websites = await websiteService.getWebsitesByIds(ids);
 
     return ResponseHelper.success(reply, { websites, total: websites.length });
+  }
+
+  /**
+   * Lọc domains theo RUNNING websites trong hệ thống
+   * POST /websites/filter-domains
+   * Permission: ALL can view
+   */
+  static async filterDomains(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const { domains, serviceType } = request.body as { domains: string[]; serviceType: string };
+
+    if (!domains || !Array.isArray(domains) || domains.length === 0) {
+      return ResponseHelper.badRequest(reply, 'Domains array is required');
+    }
+
+    if (!serviceType) {
+      return ResponseHelper.badRequest(reply, 'serviceType is required');
+    }
+
+    const websiteService = new WebsiteService(request.server);
+    const result = await websiteService.filterRunningDomains(domains, serviceType);
+
+    return ResponseHelper.success(reply, result);
   }
 }

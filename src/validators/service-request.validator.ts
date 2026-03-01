@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ServiceType, RequestStatus, DomainSelection } from '@prisma/client';
+import { ServiceType, RequestStatus, RequestPriority, DomainSelection } from '@prisma/client';
 import { paginationSchema, searchSchema, sortSchema } from './common.validator';
 
 // ==================== CONFIG SCHEMAS PER SERVICE TYPE ====================
@@ -105,6 +105,7 @@ export const createServiceRequestSchema = z
     typeRequest: z.string().max(50).optional().nullable(),
     target: z.string().optional().nullable(),
     auctionPrice: z.number().min(0).optional().nullable(),
+    priority: z.nativeEnum(RequestPriority).optional().default('NORMAL'),
     domains: z.nativeEnum(DomainSelection).optional().default('LIKEPION'),
     config: z.record(z.unknown()).optional().nullable(),
   })
@@ -147,6 +148,7 @@ export const updateServiceRequestSchema = z.object({
   typeRequest: z.string().max(50).optional().nullable(),
   target: z.string().optional().nullable(),
   auctionPrice: z.number().min(0).optional().nullable(),
+  priority: z.nativeEnum(RequestPriority).optional(),
   domains: z.nativeEnum(DomainSelection).optional(),
   config: z.record(z.unknown()).optional().nullable(),
   serviceGroupId: z.string().optional().nullable(),
@@ -173,7 +175,7 @@ export const updateStatusSchema = z.object({
 const serviceRequestFields = [
   'id', 'externalUserId', 'externalUserEmail', 'externalUserName',
   'assignedUserId', 'serviceType', 'serviceGroupId', 'externalId',
-  'name', 'typeRequest', 'target', 'auctionPrice', 'domains',
+  'name', 'typeRequest', 'target', 'auctionPrice', 'priority', 'domains',
   'config', 'idTool', 'runCount', 'status', 'createdAt', 'updatedAt',
 ] as const;
 
@@ -206,6 +208,7 @@ export const serviceRequestQuerySchema = paginationSchema
     z.object({
       serviceType: z.nativeEnum(ServiceType).optional(),
       status: z.nativeEnum(RequestStatus).optional(),
+      priority: z.nativeEnum(RequestPriority).optional(),
       externalUserId: z.string().optional(),
       domains: z.nativeEnum(DomainSelection).optional(),
     })

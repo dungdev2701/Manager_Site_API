@@ -34,6 +34,20 @@ const websiteRoutes: FastifyPluginAsync = async (
     WebsiteController.getByIds
   );
 
+  // Filter domains against RUNNING websites - ALL can view
+  fastify.post(
+    '/filter-domains',
+    { preHandler: [authMiddleware, canViewWebsites] },
+    WebsiteController.filterDomains
+  );
+
+  // Bulk update status - ADMIN, MANAGER only
+  fastify.patch(
+    '/bulk/status',
+    { preHandler: [authMiddleware, canUpdateWebsites] },
+    WebsiteController.bulkUpdateStatus
+  );
+
   // Create single website - ADMIN, MANAGER only
   fastify.post(
     '/create',

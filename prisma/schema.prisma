@@ -280,8 +280,9 @@ model ServiceRequest {
   target          String?             @db.Text        // Mục tiêu / URL target
   auctionPrice    Decimal?            @db.Decimal(10, 2)
 
-  // Status
+  // Status & Priority
   status          RequestStatus       @default(NEW)
+  priority        RequestPriority     @default(NORMAL)
 
   // Config riêng theo từng serviceType (lưu dưới dạng JSON)
   // Entity: { email, appPassword, username, entityLimit, accountType, spinContent, entityConnect, socialConnect, firstName, lastName, about, address, phone, location, website, fixedSites, avatar, cover }
@@ -322,6 +323,7 @@ model ServiceRequest {
   @@index([externalId, serviceType])
   @@index([status, deletedAt])
   @@index([createdAt])
+  @@index([priority, status])
   @@map("service_requests")
 }
 
@@ -341,6 +343,13 @@ enum RequestStatus {
   CONNECTING    // Tool đang kết nối/đăng ký
   COMPLETED     // Hoàn thành
   CANCEL        // Đã hủy
+}
+
+enum RequestPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
 }
 
 enum DomainSelection {

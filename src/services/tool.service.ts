@@ -395,7 +395,7 @@ export class ToolServiceClass {
         id: t.id,
         idTool: t.id_tool,
         lastUpdated: t.updatedAt,
-        estimateTime: t.estimate_time,
+        estimateTime: Number(t.estimate_time),
       })),
       estimateTimeUpdated: estimateTimeUpdateResult.count,
     };

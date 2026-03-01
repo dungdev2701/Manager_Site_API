@@ -1,5 +1,5 @@
 import { FastifyInstance } from 'fastify';
-import { Prisma, ServiceType, RequestStatus, DomainSelection } from '@prisma/client';
+import { Prisma, ServiceType, RequestStatus, RequestPriority, DomainSelection, WebsiteStatus, WebsiteType } from '@prisma/client';
 import { InputJsonValue } from '@prisma/client/runtime/library';
 
 export interface CreateServiceRequestInput {
@@ -14,6 +14,7 @@ export interface CreateServiceRequestInput {
   typeRequest?: string | null;
   target?: string | null;
   auctionPrice?: number | null;
+  priority?: RequestPriority;
   domains?: DomainSelection;
   config?: Record<string, unknown> | null;
 }
@@ -36,6 +37,7 @@ export interface ServiceRequestQueryInput {
   sortOrder?: 'asc' | 'desc';
   serviceType?: ServiceType;
   status?: RequestStatus;
+  priority?: RequestPriority;
   externalUserId?: string;
   domains?: DomainSelection;
 }
@@ -70,6 +72,60 @@ export class ServiceRequestService {
       }
     }
 
+    // Nếu là ENTITY và có fixedSites, lọc domain trùng với hệ thống RUNNING
+    let config = input.config;
+    let target = input.target;
+
+    if (input.serviceType === 'ENTITY' && config?.fixedSites) {
+      const fixedSitesStr = config.fixedSites as string;
+      const customerDomains = fixedSitesStr
+        .split(';')
+        .map((d) => d.trim().toLowerCase())
+        .filter((d) => d.length > 0);
+
+      if (customerDomains.length > 0) {
+        // Tìm các domain đang RUNNING và có type phù hợp
+        // ENTITY request → lấy website có type ENTITY hoặc ENTITY_SOCIAL
+        const matchingTypes: WebsiteType[] =
+          input.serviceType === 'ENTITY'
+            ? [WebsiteType.ENTITY, WebsiteType.ENTITY_SOCIAL]
+            : [input.serviceType as WebsiteType];
+
+        const runningWebsites = await this.fastify.prisma.website.findMany({
+          where: {
+            domain: { in: customerDomains },
+            status: WebsiteStatus.RUNNING,
+            types: { hasSome: matchingTypes },
+            deletedAt: null,
+          },
+          select: { domain: true },
+        });
+
+        const runningDomainSet = new Set(
+          runningWebsites.map((w) => w.domain.toLowerCase())
+        );
+
+        // Chỉ giữ lại domain trùng với hệ thống RUNNING
+        const filteredDomains = customerDomains.filter((d) =>
+          runningDomainSet.has(d)
+        );
+
+        if (filteredDomains.length === 0) {
+          throw this.fastify.httpErrors.badRequest(
+            'None of the fixed sites match any RUNNING websites in the system'
+          );
+        }
+
+        // Cập nhật config với filtered domains
+        config = {
+          ...config,
+          fixedSites: filteredDomains.join(';'),
+          entityLimit: filteredDomains.length,
+        };
+        target = String(filteredDomains.length);
+      }
+    }
+
     return this.fastify.prisma.serviceRequest.create({
       data: {
         externalUserId: input.externalUserId,
@@ -81,10 +137,11 @@ export class ServiceRequestService {
         externalId: input.externalId ?? null,
         name: input.name ?? null,
         typeRequest: input.typeRequest ?? null,
-        target: input.target ?? null,
+        target: target ?? null,
         auctionPrice: input.auctionPrice ?? null,
+        priority: input.priority ?? 'NORMAL',
         domains: input.domains ?? 'LIKEPION',
-        config: (input.config as InputJsonValue) ?? Prisma.JsonNull,
+        config: (config as InputJsonValue) ?? Prisma.JsonNull,
         status: 'DRAFT',
       },
     });
@@ -237,13 +294,14 @@ export class ServiceRequestService {
    * Lấy danh sách service requests với filter và phân trang
    */
   async findAll(query: ServiceRequestQueryInput) {
-    const { page, limit, search, sortBy, sortOrder, serviceType, status, externalUserId, domains } = query;
+    const { page, limit, search, sortBy, sortOrder, serviceType, status, priority, externalUserId, domains } = query;
     const skip = (page - 1) * limit;
 
     const where: Prisma.ServiceRequestWhereInput = {
       deletedAt: null,
       ...(serviceType && { serviceType }),
       ...(status && { status }),
+      ...(priority && { priority }),
       ...(externalUserId && { externalUserId }),
       ...(domains && { domains }),
       ...(search && {
@@ -258,7 +316,7 @@ export class ServiceRequestService {
     };
 
     // Allowed sort fields
-    const allowedSortFields = ['createdAt', 'updatedAt', 'status', 'serviceType', 'name', 'auctionPrice'];
+    const allowedSortFields = ['createdAt', 'updatedAt', 'status', 'serviceType', 'name', 'auctionPrice', 'priority'];
     const orderField = sortBy && allowedSortFields.includes(sortBy) ? sortBy : 'createdAt';
     const orderDir = sortOrder || 'desc';
 
@@ -270,12 +328,28 @@ export class ServiceRequestService {
         orderBy: { [orderField]: orderDir },
         include: {
           assignedUser: { select: { id: true, email: true, name: true } },
+          _count: {
+            select: {
+              allocationItems: {
+                where: { linkProfile: { not: null } },
+              },
+            },
+          },
         },
       }),
       this.fastify.prisma.serviceRequest.count({ where }),
     ]);
 
-    return { data, total, page, limit };
+    // Map _count to profileCount for cleaner API response
+    const dataWithCounts = data.map((req) => {
+      const { _count, ...rest } = req;
+      return {
+        ...rest,
+        profileCount: _count?.allocationItems ?? 0,
+      };
+    });
+
+    return { data: dataWithCounts, total, page, limit };
   }
 
   /**

@@ -35,12 +35,12 @@ const DEFAULT_CONFIGS: Record<string, { value: string; type: ConfigType; descrip
     description: 'Hệ số nhân phân bổ website. VD: entityLimit=100 sẽ phân bổ 250 websites (100*2.5)',
   },
   CLAIM_TIMEOUT_MINUTES: {
-    value: '5',
+    value: '15',
     type: 'NUMBER',
     description: 'Thời gian timeout (phút) cho mỗi task đã claim. Sau thời gian này task sẽ được release.',
   },
   MAX_DAILY_ALLOCATIONS: {
-    value: '3',
+    value: '30',
     type: 'NUMBER',
     description: 'Số lần tối đa một website được phân bổ trong ngày',
   },
@@ -69,6 +69,11 @@ const DEFAULT_CONFIGS: Record<string, { value: string; type: ConfigType; descrip
     type: 'BOOLEAN',
     description: 'Bật/tắt việc thêm dấu chấm vào email khi retry failed tasks',
   },
+  REQUEST_COMPLETION_TIME_PER_100: {
+    value: '35',
+    type: 'NUMBER',
+    description: 'Thời gian timeout (phút) cho mỗi 100 entity. VD: 200 entity → timeout 70 phút. Request < 100 entity → timeout 30 phút cố định.',
+  },
 };
 
 // ==================== SERVICE ====================
@@ -82,7 +87,7 @@ const DEFAULT_CONFIGS: Record<string, { value: string; type: ConfigType; descrip
  * - Parse values theo type (NUMBER, BOOLEAN, JSON, STRING)
  */
 export class SystemConfigService {
-  constructor(private fastify: FastifyInstance) {}
+  constructor(private fastify: FastifyInstance) { }
 
   /**
    * Parse config value theo type

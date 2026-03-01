@@ -50,6 +50,32 @@ const allocationTaskRoutes: FastifyPluginAsync = async (
     controller.releaseExpiredClaims.bind(controller)
   );
 
+  /**
+   * POST /allocation-tasks/auto-assign-tools
+   * Monitor Service triggers auto-assignment of idTool for unassigned requests
+   */
+  fastify.post(
+    '/auto-assign-tools',
+    {
+      preHandler: monitorApiKeyMiddleware,
+      config: { rateLimit: RATE_LIMITS.normal },
+    },
+    controller.autoAssignTools.bind(controller)
+  );
+
+  /**
+   * POST /allocation-tasks/re-allocate
+   * Monitor Service triggers re-allocation for active requests that need more items
+   */
+  fastify.post(
+    '/re-allocate',
+    {
+      preHandler: monitorApiKeyMiddleware,
+      config: { rateLimit: RATE_LIMITS.normal },
+    },
+    controller.reAllocate.bind(controller)
+  );
+
   // ==================== TOOL APIs ====================
   // No authentication required - tools use their own identification
 

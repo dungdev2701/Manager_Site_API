@@ -146,6 +146,59 @@ export class AllocationTaskController {
     });
   }
 
+  /**
+   * POST /allocation-tasks/auto-assign-tools
+   *
+   * Monitor Service gọi để auto-assign idTool cho NEW/PENDING requests
+   * chưa có tool pair assigned.
+   *
+   * Logic:
+   * - Tìm valid tool pairs (Normal X + Captcha X, both RUNNING + INDIVIDUAL)
+   * - customerType='priority' → assign to HIGH/URGENT requests
+   * - customerType='normal'/null → assign to LOW/NORMAL requests
+   * - Sort by auctionPrice DESC, createdAt ASC
+   * - Round-robin distribute across pairs
+   */
+  async autoAssignTools(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.allocationService.autoAssignTools();
+    reply.send({
+      success: true,
+      message: result.assigned > 0
+        ? `Auto-assigned idTool to ${result.assigned} requests`
+        : 'No requests to assign',
+      data: result,
+    });
+  }
+
+  /**
+   * POST /allocation-tasks/re-allocate
+   *
+   * Monitor Service gọi để phân bổ thêm websites cho requests đang chạy
+   * nhưng kết quả chưa đủ và không còn items active.
+   *
+   * Logic:
+   * - Tìm PENDING/RUNNING requests
+   * - Check: không còn items NEW/REGISTERING/PROFILING
+   * - Check: completedLinks < entityLimit
+   * - Phân bổ thêm dựa trên deficit, loại trừ domains đã dùng
+   */
+  async reAllocate(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.allocationService.reAllocateForActiveRequests();
+    reply.send({
+      success: true,
+      message: result.processed > 0
+        ? `Re-allocated for ${result.processed} requests`
+        : 'No requests need re-allocation',
+      data: result,
+    });
+  }
+
   // ==================== TOOL APIs ====================
 
   /**

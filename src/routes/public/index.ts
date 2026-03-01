@@ -560,6 +560,42 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
   );
 
   /**
+   * POST /api/public/allocation-tasks/auto-assign-tools
+   *
+   * Monitor Service gọi để auto-assign idTool cho requests chưa có tool pair
+   *
+   * Logic:
+   * 1. Tìm valid tool pairs (Normal X + Captcha X, both RUNNING + INDIVIDUAL)
+   * 2. Tìm requests chưa có idTool (status NEW/PENDING, idTool IS NULL)
+   * 3. customerType='priority' → assign to HIGH/URGENT requests
+   * 4. customerType='normal'/null → assign to LOW/NORMAL requests
+   * 5. Within group: sort by auctionPrice DESC, createdAt ASC
+   * 6. Round-robin distribute across available pairs
+   * 7. If no matching tool pair → idTool stays NULL (GLOBAL tools will claim)
+   *
+   * Xác thực: Monitor API Key
+   */
+  fastify.post(
+    '/allocation-tasks/auto-assign-tools',
+    { preHandler: monitorApiKeyMiddleware },
+    allocationController.autoAssignTools.bind(allocationController)
+  );
+
+  /**
+   * POST /api/public/allocation-tasks/re-allocate
+   *
+   * Monitor Service gọi để phân bổ thêm websites cho requests đang chạy
+   * nhưng kết quả chưa đủ và không còn items active (NEW/REGISTERING/PROFILING).
+   *
+   * Xác thực: Monitor API Key
+   */
+  fastify.post(
+    '/allocation-tasks/re-allocate',
+    { preHandler: monitorApiKeyMiddleware },
+    allocationController.reAllocate.bind(allocationController)
+  );
+
+  /**
    * GET /api/public/allocation-tasks/statistics
    *
    * Lấy statistics (dùng cho monitoring dashboard)

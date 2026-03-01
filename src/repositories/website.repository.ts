@@ -54,6 +54,7 @@ export class WebsiteRepository {
         domain: true,
         types: true, // Include types for merge logic
         status: true,
+        metrics: true, // Include metrics for merge logic
         createdAt: true,
       },
     });
@@ -754,6 +755,23 @@ export class WebsiteRepository {
         },
       },
     });
+  }
+
+  /**
+   * Update status cho nhiều websites theo IDs (bulk update status)
+   */
+  async updateManyStatusByIds(ids: string[], status: WebsiteStatus): Promise<number> {
+    const result = await this.prisma.website.updateMany({
+      where: {
+        id: { in: ids },
+        deletedAt: null,
+      },
+      data: {
+        status,
+        lastCheckedAt: new Date(),
+      },
+    });
+    return result.count;
   }
 
   /**

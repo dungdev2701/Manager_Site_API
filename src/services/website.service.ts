@@ -82,8 +82,9 @@ export class WebsiteService {
    * Ví dụ: docs.google.com/document, drive.google.com/file/d/pdf
    */
   async createWebsite(input: CreateWebsiteInput, createdBy?: string) {
-    // Xác định types
-    const types = input.types || [WebsiteType.ENTITY];
+    // Check if user explicitly provided types
+    const hasTypes = !!(input.types && input.types.length > 0);
+    const types = hasTypes ? input.types! : [WebsiteType.ENTITY]; // Default only for NEW domains
 
     // Extract domain dựa vào type
     // GG_STACKING, PODCAST: giữ nguyên path (docs.google.com/document)
@@ -96,9 +97,38 @@ export class WebsiteService {
     // Check domain đã tồn tại chưa
     const existingWebsite = await this.websiteRepository.findByDomain(domain);
     if (existingWebsite) {
-      throw this.fastify.httpErrors.conflict(
-        `Domain "${domain}" already exists`
-      );
+      // Domain already exists -> update types (merge) and metrics instead of throwing error
+      const updateData: Prisma.WebsiteUpdateInput = {};
+
+      // Only merge types if user explicitly provided types
+      if (hasTypes) {
+        const currentTypes = existingWebsite.types || [];
+        const existingTypes = new Set(currentTypes);
+        const typesToAdd = types.filter(t => !existingTypes.has(t));
+        if (typesToAdd.length > 0) {
+          updateData.types = [...currentTypes, ...typesToAdd];
+        }
+      }
+
+      // Update metrics if provided
+      if (input.metrics) {
+        // Merge metrics: keep existing + override with new values
+        const existingMetrics = (existingWebsite.metrics as Record<string, unknown>) || {};
+        updateData.metrics = { ...existingMetrics, ...input.metrics } as Prisma.InputJsonValue;
+      }
+
+      // Update notes if provided
+      if (input.notes) {
+        updateData.notes = input.notes;
+      }
+
+      // Only update if there's something to change
+      if (Object.keys(updateData).length > 0) {
+        const updated = await this.websiteRepository.update(existingWebsite.id, updateData, createdBy);
+        return updated;
+      }
+
+      return existingWebsite;
     }
 
     // Tạo website mới
@@ -134,10 +164,11 @@ export class WebsiteService {
     input: CreateBulkWebsitesInput,
     createdBy?: string
   ): Promise<BulkCreateResult> {
-    // Đảm bảo types là WebsiteType[] enum, không phải string[]
-    const types: WebsiteType[] = input.types && input.types.length > 0
-      ? input.types.map(t => t as WebsiteType)
-      : [WebsiteType.ENTITY];
+    // Types provided by user (undefined means "don't change types for existing domains")
+    const hasTypes = input.types && input.types.length > 0;
+    const types: WebsiteType[] = hasTypes
+      ? input.types!.map(t => t as WebsiteType)
+      : [WebsiteType.ENTITY]; // Default only used for NEW domains
     const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
 
     // 1. Extract unique domains (in-memory operation)
@@ -173,17 +204,21 @@ export class WebsiteService {
     const newDomains = domains.filter((d) => !existingDomainsMap.has(d));
     const domainsToMergeTypes: Array<{ domain: string; newTypes: WebsiteType[] }> = [];
 
-    for (const [domain, existingWebsite] of existingDomainsMap) {
-      // Tìm types mới chưa có trong website hiện tại
-      // Handle null/undefined types
-      const currentTypes = existingWebsite.types || [];
-      const existingTypes = new Set(currentTypes);
-      const typesToAdd = types.filter(t => !existingTypes.has(t));
+    // Only merge types if user explicitly selected types
+    // If types is undefined/empty, keep existing types unchanged
+    if (hasTypes) {
+      for (const [domain, existingWebsite] of existingDomainsMap) {
+        // Tìm types mới chưa có trong website hiện tại
+        // Handle null/undefined types
+        const currentTypes = existingWebsite.types || [];
+        const existingTypes = new Set(currentTypes);
+        const typesToAdd = types.filter(t => !existingTypes.has(t));
 
-      if (typesToAdd.length > 0) {
-        // Merge types: giữ types cũ + thêm types mới
-        const mergedTypes = [...currentTypes, ...typesToAdd];
-        domainsToMergeTypes.push({ domain, newTypes: mergedTypes });
+        if (typesToAdd.length > 0) {
+          // Merge types: giữ types cũ + thêm types mới
+          const mergedTypes = [...currentTypes, ...typesToAdd];
+          domainsToMergeTypes.push({ domain, newTypes: mergedTypes });
+        }
       }
     }
 
@@ -192,7 +227,7 @@ export class WebsiteService {
     if (newDomains.length > 0) {
       const createData = newDomains.map((domain) => ({
         domain,
-        types,
+        types, // New domains always get types (default ENTITY if not specified)
         status: WebsiteStatus.NEW,
         ...(createdBy && { createdBy }),
       }));
@@ -239,13 +274,14 @@ export class WebsiteService {
     createdBy?: string
   ): Promise<BulkCreateResult> {
     const invalid: string[] = [];
-    const validWebsites: { domain: string; types?: WebsiteType[]; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
+    const validWebsites: { domain: string; types?: WebsiteType[]; hasTypes: boolean; metrics?: WebsiteMetrics; status?: WebsiteStatus }[] = [];
 
     // 1. Extract và validate domains
     for (const item of input.websites) {
       try {
-        const types = item.types || [WebsiteType.ENTITY];
-        const shouldKeepPath = types.includes(WebsiteType.GG_STACKING) || types.includes(WebsiteType.PODCAST);
+        const hasTypes = !!(item.types && item.types.length > 0);
+        const types = hasTypes ? item.types : [WebsiteType.ENTITY]; // Default only for new domains
+        const shouldKeepPath = types!.includes(WebsiteType.GG_STACKING) || types!.includes(WebsiteType.PODCAST);
 
         // GG_STACKING, PODCAST: giữ nguyên path
         // Các type khác: chỉ giữ subdomain, bỏ path
@@ -257,8 +293,9 @@ export class WebsiteService {
           validWebsites.push({
             domain,
             types,
+            hasTypes,
             metrics: item.metrics,
-            status: item.status ? (item.status as WebsiteStatus) : WebsiteStatus.NEW,
+            status: item.status ? (item.status as WebsiteStatus) : undefined, // Only set status if explicitly provided
           });
         } else {
           invalid.push(item.domain);
@@ -295,24 +332,35 @@ export class WebsiteService {
     for (const inputWebsite of uniqueWebsites) {
       const existingWebsite = existingDomainsMap.get(inputWebsite.domain);
       if (existingWebsite) {
-        const inputTypes = inputWebsite.types || [WebsiteType.ENTITY];
-        // Handle null/undefined types
-        const currentTypes = existingWebsite.types || [];
-        const existingTypes = new Set(currentTypes);
+        // Only merge types if user explicitly provided types
+        // If types is undefined/empty, keep existing types unchanged
+        let mergedTypes: WebsiteType[] | undefined = undefined;
+        if (inputWebsite.hasTypes) {
+          const inputTypes = inputWebsite.types || [];
+          const currentTypes = existingWebsite.types || [];
+          const existingTypes = new Set(currentTypes);
 
-        // Merge types: giữ types cũ + thêm types mới
-        const typesToAdd = inputTypes.filter(t => !existingTypes.has(t));
-        const mergedTypes = typesToAdd.length > 0
-          ? [...currentTypes, ...typesToAdd]
-          : undefined; // Không cần update nếu không có types mới
+          // Merge types: giữ types cũ + thêm types mới
+          const typesToAdd = inputTypes.filter(t => !existingTypes.has(t));
+          mergedTypes = typesToAdd.length > 0
+            ? [...currentTypes, ...typesToAdd]
+            : undefined; // Không cần update nếu không có types mới
+        }
+
+        // Merge metrics: keep existing + override with new values
+        let mergedMetrics: Prisma.InputJsonValue | undefined = undefined;
+        if (inputWebsite.metrics) {
+          const existingMetrics = (existingWebsite.metrics as Record<string, unknown>) || {};
+          mergedMetrics = { ...existingMetrics, ...inputWebsite.metrics } as Prisma.InputJsonValue;
+        }
 
         // Chỉ update nếu có gì thay đổi (types mới, status, hoặc metrics)
-        if (mergedTypes || inputWebsite.status || inputWebsite.metrics) {
+        if (mergedTypes || inputWebsite.status || mergedMetrics) {
           websitesToUpdate.push({
             domain: inputWebsite.domain,
             types: mergedTypes,
             status: inputWebsite.status,
-            metrics: inputWebsite.metrics as Prisma.InputJsonValue | undefined,
+            metrics: mergedMetrics,
           });
         }
       }
@@ -620,10 +668,65 @@ export class WebsiteService {
   }
 
   /**
+   * Bulk update status cho nhiều websites theo IDs
+   * Permission: ADMIN, MANAGER
+   */
+  async bulkUpdateStatus(ids: string[], status: WebsiteStatus): Promise<{ updated: number }> {
+    if (!ids || ids.length === 0) {
+      throw this.fastify.httpErrors.badRequest('IDs array is required');
+    }
+
+    if (ids.length > 5000) {
+      throw this.fastify.httpErrors.badRequest('Maximum 5000 IDs allowed');
+    }
+
+    const updated = await this.websiteRepository.updateManyStatusByIds(ids, status);
+    return { updated };
+  }
+
+  /**
    * Lấy nhiều websites theo IDs
    * Permission: ALL
    */
   async getWebsitesByIds(ids: string[]) {
     return this.websiteRepository.findManyByIds(ids);
+  }
+
+  /**
+   * Lọc danh sách domains theo status RUNNING và types phù hợp
+   * Dùng cho Fixed Sites: chỉ giữ lại domain có trong hệ thống
+   */
+  async filterRunningDomains(
+    domains: string[],
+    serviceType: string
+  ): Promise<{ matched: string[]; unmatched: string[] }> {
+    const normalizedDomains = domains.map((d) => d.trim().toLowerCase()).filter((d) => d.length > 0);
+
+    if (normalizedDomains.length === 0) {
+      return { matched: [], unmatched: [] };
+    }
+
+    // ENTITY → lấy website có type ENTITY hoặc ENTITY_SOCIAL
+    const matchingTypes: WebsiteType[] =
+      serviceType === 'ENTITY'
+        ? [WebsiteType.ENTITY, WebsiteType.ENTITY_SOCIAL]
+        : [serviceType as WebsiteType];
+
+    const runningWebsites = await this.fastify.prisma.website.findMany({
+      where: {
+        domain: { in: normalizedDomains },
+        status: WebsiteStatus.RUNNING,
+        types: { hasSome: matchingTypes },
+        deletedAt: null,
+      },
+      select: { domain: true },
+    });
+
+    const runningDomainSet = new Set(runningWebsites.map((w) => w.domain.toLowerCase()));
+
+    const matched = normalizedDomains.filter((d) => runningDomainSet.has(d));
+    const unmatched = normalizedDomains.filter((d) => !runningDomainSet.has(d));
+
+    return { matched, unmatched };
   }
 }
