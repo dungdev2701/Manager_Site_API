@@ -138,7 +138,18 @@ export const websiteQuerySchema = z.object({
   endDate: z.string().optional(), // Format: YYYY-MM-DD
 });
 
+/**
+ * Schema cho check-duplicates (đối chiếu list domain với hệ thống)
+ */
+export const checkDuplicatesSchema = z.object({
+  domains: z
+    .array(z.string().min(1))
+    .min(1, 'At least one domain is required')
+    .max(5000, 'Maximum 5000 domains allowed'),
+});
+
 // Export types
+export type CheckDuplicatesDTO = z.infer<typeof checkDuplicatesSchema>;
 export type WebsiteTypeDTO = z.infer<typeof websiteTypeEnum>;
 export type WebsiteMetricsDTO = z.infer<typeof websiteMetricsSchema>;
 export type CreateWebsiteDTO = z.infer<typeof createWebsiteSchema>;

@@ -5,6 +5,7 @@ import {
   createGmailSchema,
   updateGmailSchema,
   gmailQuerySchema,
+  bulkCreateGmailSchema,
 } from '../validators/gmail.validator';
 import { GmailQueryInput } from '../services/gmail.service';
 
@@ -319,5 +320,65 @@ export class GmailController {
         failed: failCount,
       },
     });
+  }
+
+  /**
+   * Get gmail info by email address
+   * GET /gmails/get-by-email?email=xxx@gmail.com
+   *
+   * Supports both JWT auth token and PUBLIC_API_KEY via x-api-key header
+   */
+  static async getByEmail(request: FastifyRequest, reply: FastifyReply) {
+    const { email, status, limit } = request.query as { email?: string; status?: string; limit?: string };
+
+    const gmailService = new GmailService(request.server);
+    const limitNum = limit ? parseInt(limit, 10) : undefined;
+    const gmails = await gmailService.getGmailsByQuery(email, status as any, limitNum);
+
+    if (gmails.length === 0) {
+      return ResponseHelper.notFound(reply, 'Gmail not found');
+    }
+
+    return ResponseHelper.success(reply, gmails);
+  }
+
+  /**
+   * Claim emails: lấy email NEW và chuyển sang RUNNING (atomic, không trùng)
+   * POST /gmails/claim?limit=5
+   *
+   * Supports both JWT auth token and PUBLIC_API_KEY via x-api-key header
+   */
+  static async claim(request: FastifyRequest, reply: FastifyReply) {
+    const { limit } = request.query as { limit?: string };
+    const limitNum = limit ? parseInt(limit, 10) : 1;
+
+    if (limitNum < 1 || limitNum > 100) {
+      return ResponseHelper.badRequest(reply, 'limit must be between 1 and 100');
+    }
+
+    const gmailService = new GmailService(request.server);
+    const gmails = await gmailService.claimGmails(limitNum);
+
+    return ResponseHelper.success(reply, {
+      claimed: gmails.length,
+      gmails,
+    });
+  }
+
+  /**
+   * Bulk create gmails
+   * POST /gmails/create-bulk
+   */
+  static async bulkCreate(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const validatedData = bulkCreateGmailSchema.parse(request.body);
+
+    const gmailService = new GmailService(request.server);
+    const result = await gmailService.bulkCreateGmails(validatedData.emails);
+
+    return ResponseHelper.success(reply, result, `${result.created} emails created`);
   }
 }

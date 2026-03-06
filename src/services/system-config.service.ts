@@ -69,10 +69,20 @@ const DEFAULT_CONFIGS: Record<string, { value: string; type: ConfigType; descrip
     type: 'BOOLEAN',
     description: 'Bật/tắt việc thêm dấu chấm vào email khi retry failed tasks',
   },
+  EMAIL_DOT_COUNT: {
+    value: '2',
+    type: 'NUMBER',
+    description: 'Số dấu chấm tối đa thêm vào email khi accountType=multiple (Gmail dot trick). 0 = tắt.',
+  },
   REQUEST_COMPLETION_TIME_PER_100: {
     value: '35',
     type: 'NUMBER',
     description: 'Thời gian timeout (phút) cho mỗi 100 entity. VD: 200 entity → timeout 70 phút. Request < 100 entity → timeout 30 phút cố định.',
+  },
+  COMPLETION_THRESHOLD_PERCENT: {
+    value: '110',
+    type: 'NUMBER',
+    description: 'Phần trăm hoàn thành so với entityLimit để tính request đạt target. VD: 110 = cần 110% entityLimit. entityLimit=100 → cần 110 completedLinks.',
   },
 };
 

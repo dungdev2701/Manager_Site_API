@@ -147,6 +147,44 @@ export class AllocationTaskController {
   }
 
   /**
+   * POST /allocation-tasks/process-supplement
+   *
+   * Monitor Service gọi để xử lý RE_RUN requests (chạy bổ sung)
+   * Allocate websites cho phần deficit và chuyển status RE_RUN → RE_RUNNING
+   */
+  async processSupplementRequests(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.allocationService.processSupplementRequests();
+    reply.send({
+      success: true,
+      message: 'Processed supplement requests',
+      data: result,
+    });
+  }
+
+  /**
+   * POST /allocation-tasks/check-completed-rerun
+   *
+   * Monitor Service gọi để kiểm tra COMPLETED requests chưa đạt target
+   * và tự động chuyển sang RE_RUN (nếu retryCount < 2)
+   */
+  async checkCompletedForReRun(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> {
+    const result = await this.allocationService.checkCompletedForReRun();
+    reply.send({
+      success: true,
+      message: result.transitioned > 0
+        ? `Transitioned ${result.transitioned} requests to RE_RUN`
+        : 'No requests need supplement',
+      data: result,
+    });
+  }
+
+  /**
    * POST /allocation-tasks/auto-assign-tools
    *
    * Monitor Service gọi để auto-assign idTool cho NEW/PENDING requests

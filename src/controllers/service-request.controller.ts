@@ -1,4 +1,5 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
+import { RequestStatus } from '@prisma/client';
 import { ServiceRequestService } from '../services/service-request.service';
 import { ResponseHelper } from '../utils/response';
 import {
@@ -135,6 +136,27 @@ export class ServiceRequestController {
     const result = await service.quickUpdate(id, body);
 
     return ResponseHelper.success(reply, result, 'Service request updated');
+  }
+
+  /**
+   * Set request to RE_RUN for supplement run
+   * POST /service-requests/:id/re-run
+   */
+  static async reRun(request: FastifyRequest, reply: FastifyReply) {
+    const { id } = request.params as { id: string };
+
+    const service = new ServiceRequestService(request.server);
+
+    // Validate transition COMPLETED → RE_RUN
+    const result = await service.updateStatus(id, RequestStatus.RE_RUN);
+
+    // Reset idTool so autoAssignTools can assign a RE_RUNNING tool pair
+    await request.server.prisma.serviceRequest.update({
+      where: { id },
+      data: { idTool: null },
+    });
+
+    return ResponseHelper.success(reply, result, 'Request set to RE_RUN for supplement');
   }
 
   /**

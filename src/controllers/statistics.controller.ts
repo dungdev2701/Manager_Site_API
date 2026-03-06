@@ -26,7 +26,19 @@ export class StatisticsController {
   }
 
   async getOverview(request: FastifyRequest, reply: FastifyReply) {
-    const overview = await this.statisticsService.getOverview();
+    const { startDate, endDate, days } = request.query as DateRangeQuery;
+
+    let overview;
+    if (startDate && endDate) {
+      overview = await this.statisticsService.getOverview({
+        startDate: new Date(startDate),
+        endDate: new Date(endDate),
+      });
+    } else {
+      const daysNum = days ? parseInt(days) : 30;
+      overview = await this.statisticsService.getOverview({ daysAgo: daysNum });
+    }
+
     return reply.send({
       success: true,
       data: overview,
@@ -144,10 +156,19 @@ export class StatisticsController {
   }
 
   async getStatusChanges(request: FastifyRequest, reply: FastifyReply) {
-    const { days } = request.query as DateRangeQuery;
-    const daysNum = days ? parseInt(days) : 30;
+    const { startDate, endDate, days } = request.query as DateRangeQuery;
 
-    const stats = await this.statisticsService.getStatusChanges(daysNum);
+    let stats;
+    if (startDate && endDate) {
+      stats = await this.statisticsService.getStatusChanges({
+        startDate: new Date(startDate),
+        endDate: new Date(endDate),
+      });
+    } else {
+      const daysNum = days ? parseInt(days) : 30;
+      stats = await this.statisticsService.getStatusChanges({ daysAgo: daysNum });
+    }
+
     return reply.send({
       success: true,
       data: stats,

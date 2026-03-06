@@ -51,3 +51,6 @@ temp/
 
 # Uploads
 uploads/
+
+# Local docs (not tracked)
+docs/

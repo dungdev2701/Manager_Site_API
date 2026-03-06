@@ -1,4 +1,4 @@
-import { FastifyInstance } from 'fastify';
+﻿import { FastifyInstance } from 'fastify';
 import {
   PrismaClient,
   WebsiteStatus,
@@ -15,6 +15,18 @@ import {
   ServiceRequest,
 } from '@prisma/client';
 import { MySQLExternalRepositories } from '../repositories/mysql-external';
+import { AllocationMetricsService } from './allocation/allocation-metrics.service';
+import {
+  isSuccessByProfile,
+  shouldCountOnce,
+  TERMINAL_STATUSES,
+} from './allocation/allocation-rules';
+import { calculateSupplementDeficit } from './allocation/commands/supplement-requests.command';
+import { calculateRequestTimeoutMinutes } from './allocation/commands/timeout-requests.command';
+import { CompleteTaskUseCase } from './allocation/use-cases/complete-task.use-case';
+import { ReleaseExpiredClaimsUseCase } from './allocation/use-cases/release-expired-claims.use-case';
+import { TimeoutExpiredRequestsUseCase } from './allocation/use-cases/timeout-requests.use-case';
+import { SupplementRequestsUseCase } from './allocation/use-cases/supplement-requests.use-case';
 
 // ==================== TYPES ====================
 
@@ -23,6 +35,7 @@ interface WebsiteForAllocation {
   domain: string;
   traffic: number;
   successRate: number;
+  dailyCount: number; // how many times allocated today (for round-robin distribution)
 }
 
 interface AllocationResult {
@@ -50,6 +63,20 @@ interface ClaimResult {
     requestId: string | null;
   }>;
   message?: string;
+}
+
+interface ToolPairInfo {
+  pairNumber: string;
+  idToolValue: string;
+  customerType: string;
+  service: ToolService;
+}
+
+interface AssignmentDetail {
+  requestId: string;
+  idTool: string;
+  priority: string;
+  auctionPrice: string | null;
 }
 
 interface CachedConfig {
@@ -92,7 +119,17 @@ const CONFIG_KEYS = {
   MAX_DAILY_ALLOCATIONS: 'MAX_DAILY_ALLOCATIONS',
   TRAFFIC_THRESHOLD: 'TRAFFIC_THRESHOLD',
   REQUEST_COMPLETION_TIME_PER_100: 'REQUEST_COMPLETION_TIME_PER_100',
+  EMAIL_DOT_COUNT: 'EMAIL_DOT_COUNT',
+  COMPLETION_THRESHOLD_PERCENT: 'COMPLETION_THRESHOLD_PERCENT',
 } as const;
+
+const DEFAULT_EMAIL_DOT_COUNT = 2;
+
+// Default completion threshold percent (110% = need 110% of entityLimit to consider target reached)
+const DEFAULT_COMPLETION_THRESHOLD_PERCENT = 110;
+
+// Max retries for supplement runs (retryCount >= this â†’ stop re-running)
+const MAX_SUPPLEMENT_RETRIES = 2;
 
 /**
  * Generate a random password with format like: dg2n@gCcuvcl
@@ -137,6 +174,11 @@ function generateRandomPassword(): string {
 export class ServiceRequestAllocationService {
   private prisma: PrismaClient;
   private mysqlRepo: MySQLExternalRepositories | null = null;
+  private allocationMetrics: AllocationMetricsService;
+  private completeTaskUseCase: CompleteTaskUseCase;
+  private releaseExpiredClaimsUseCase: ReleaseExpiredClaimsUseCase;
+  private timeoutExpiredRequestsUseCase: TimeoutExpiredRequestsUseCase;
+  private supplementRequestsUseCase: SupplementRequestsUseCase;
 
   // In-memory cache for configs
   private configCache: Map<string, CachedConfig> = new Map();
@@ -150,6 +192,24 @@ export class ServiceRequestAllocationService {
 
   constructor(private fastify: FastifyInstance) {
     this.prisma = fastify.prisma;
+    this.allocationMetrics = new AllocationMetricsService();
+    this.completeTaskUseCase = new CompleteTaskUseCase({
+      prisma: this.prisma,
+      log: this.fastify.log,
+      allocationMetrics: this.allocationMetrics,
+    });
+    this.releaseExpiredClaimsUseCase = new ReleaseExpiredClaimsUseCase({
+      prisma: this.prisma,
+      log: this.fastify.log,
+    });
+    this.timeoutExpiredRequestsUseCase = new TimeoutExpiredRequestsUseCase({
+      prisma: this.prisma,
+      log: this.fastify.log,
+    });
+    this.supplementRequestsUseCase = new SupplementRequestsUseCase({
+      prisma: this.prisma,
+      log: this.fastify.log,
+    });
     // MySQL repo is optional - only used for syncing to legacy tables
     if (fastify.mysql) {
       this.mysqlRepo = new MySQLExternalRepositories(fastify.mysql);
@@ -293,15 +353,120 @@ export class ServiceRequestAllocationService {
   }
 
   /**
+   * Get email dot count (max dots to add for accountType=multiple)
+   */
+  async getEmailDotCount(): Promise<number> {
+    return this.getConfig(CONFIG_KEYS.EMAIL_DOT_COUNT, DEFAULT_EMAIL_DOT_COUNT);
+  }
+
+  /**
+   * Get completion threshold percent (e.g. 110 = need 110% of entityLimit)
+   */
+  async getCompletionThresholdPercent(): Promise<number> {
+    return this.getConfig(CONFIG_KEYS.COMPLETION_THRESHOLD_PERCENT, DEFAULT_COMPLETION_THRESHOLD_PERCENT);
+  }
+
+  /**
+   * Calculate completion target based on entityLimit and threshold percent
+   * VD: entityLimit=100, threshold=110 â†’ target=110
+   * VD: entityLimit=200, threshold=110 â†’ target=220
+   */
+  getCompletionTarget(entityLimit: number, thresholdPercent: number): number {
+    return Math.ceil(entityLimit * thresholdPercent / 100);
+  }
+
+  /**
+   * Gmail dot trick: add random dots to email local part
+   * Gmail ignores dots in local part, so u.ser@gmail.com = user@gmail.com
+   * Each call produces a different variation for the same email
+   *
+   * @param email - Original email address
+   * @param maxDots - Max number of dots to add (from config EMAIL_DOT_COUNT)
+   */
+  private modifyEmailWithDots(email: string, maxDots: number): string {
+    const [localPart, domain] = email.split('@');
+    if (!localPart || localPart.length < 2 || !domain || maxDots <= 0) {
+      return email;
+    }
+
+    // Clean existing dots first to avoid double dots
+    const cleanLocal = localPart.replace(/\./g, '');
+    if (cleanLocal.length < 2) return email;
+
+    // Limit dots based on local part length
+    const effectiveMaxDots = Math.min(maxDots, cleanLocal.length - 1);
+    const numDots = Math.floor(Math.random() * effectiveMaxDots) + 1;
+
+    // Generate random unique positions (between chars, not at start)
+    const possiblePositions: number[] = [];
+    for (let i = 1; i < cleanLocal.length; i++) {
+      possiblePositions.push(i);
+    }
+
+    // Fisher-Yates shuffle and take first numDots
+    for (let i = possiblePositions.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [possiblePositions[i], possiblePositions[j]] = [possiblePositions[j], possiblePositions[i]];
+    }
+    const dotPositions = possiblePositions.slice(0, numDots).sort((a, b) => a - b);
+
+    // Insert dots at positions (from right to left to keep indices valid)
+    let result = cleanLocal;
+    for (let i = dotPositions.length - 1; i >= 0; i--) {
+      const pos = dotPositions[i];
+      result = result.slice(0, pos) + '.' + result.slice(pos);
+    }
+
+    return `${result}@${domain}`;
+  }
+
+  /**
+   * Add exactly one new dot to email local part while preserving existing dots.
+   * - Keeps all existing dots unchanged
+   * - Avoids creating consecutive dots
+   * - If no valid position exists, returns original email
+   */
+  private addOneDotPreserveExisting(email: string): string {
+    const [localPart, domain] = email.split('@');
+    if (!localPart || !domain || localPart.length < 2) {
+      return email;
+    }
+
+    const validPositions: number[] = [];
+
+    // Insert positions are between characters: [1..length-1]
+    for (let i = 1; i < localPart.length; i++) {
+      const left = localPart[i - 1];
+      const right = localPart[i];
+
+      // Keep existing dots and avoid creating ".."
+      if (left !== '.' && right !== '.') {
+        validPositions.push(i);
+      }
+    }
+
+    if (validPositions.length === 0) {
+      return email;
+    }
+
+    const randomIndex = Math.floor(Math.random() * validPositions.length);
+    const insertPos = validPositions[randomIndex];
+    const newLocal = localPart.slice(0, insertPos) + '.' + localPart.slice(insertPos);
+
+    return `${newLocal}@${domain}`;
+  }
+
+  /**
    * Calculate timeout for a request based on entityLimit
    * - entityLimit >= 100: timeout = (entityLimit / 100) * completionTimePer100
    * - entityLimit < 100: timeout = 30 minutes (fixed, priority completion)
    */
   calculateRequestTimeout(entityLimit: number, completionTimePer100: number): number {
-    if (entityLimit < 100) {
-      return SMALL_REQUEST_TIMEOUT_MINUTES;
-    }
-    return Math.ceil((entityLimit / 100) * completionTimePer100);
+    return calculateRequestTimeoutMinutes(
+      entityLimit,
+      completionTimePer100,
+      SMALL_REQUEST_TIMEOUT_MINUTES
+    );
   }
 
   // ==================== MAIN ALLOCATION FLOW ====================
@@ -358,17 +523,34 @@ export class ServiceRequestAllocationService {
     // Process requests (could be parallelized with concurrency limit)
     for (const request of requestsToProcess) {
       try {
-        await this.allocateForRequestOptimized(request, multiplier, claimTimeout);
-
-        // Update status to PENDING
-        await this.prisma.serviceRequest.update({
-          where: { id: request.id },
+        // Claim request atomically to prevent duplicate processing by concurrent workers.
+        const claimResult = await this.prisma.serviceRequest.updateMany({
+          where: {
+            id: request.id,
+            status: RequestStatus.NEW,
+            deletedAt: null,
+          },
           data: { status: RequestStatus.PENDING },
         });
+
+        if (claimResult.count === 0) {
+          skipped++;
+          continue;
+        }
+
+        await this.allocateForRequestOptimized(request, multiplier, claimTimeout);
 
         processed++;
       } catch (error) {
         this.fastify.log.error({ err: error, requestId: request.id }, 'Failed to process request');
+        await this.prisma.serviceRequest.updateMany({
+          where: {
+            id: request.id,
+            status: RequestStatus.PENDING,
+            deletedAt: null,
+          },
+          data: { status: RequestStatus.NEW },
+        });
         await this.createAlert({
           type: AlertType.ALLOCATION_FAILED,
           severity: AlertSeverity.ERROR,
@@ -391,7 +573,7 @@ export class ServiceRequestAllocationService {
    * 1. No items in NEW, REGISTERING, PROFILING status (all processed)
    * 2. completedLinks + failedLinks < entityLimit (results not enough)
    * 3. Request not timed out
-   * → Allocate additional websites based on deficit (entityLimit - completedLinks)
+   * â†’ Allocate additional websites based on deficit (entityLimit - completedLinks)
    *
    * Excludes domains already allocated to this request to avoid duplicates.
    */
@@ -411,7 +593,7 @@ export class ServiceRequestAllocationService {
     // Find PENDING/RUNNING requests that are not completed or timed out
     const activeRequests = await this.prisma.serviceRequest.findMany({
       where: {
-        status: { in: [RequestStatus.PENDING, RequestStatus.RUNNING] },
+        status: { in: [RequestStatus.PENDING, RequestStatus.RUNNING, RequestStatus.RE_RUNNING] },
         deletedAt: null,
       },
       orderBy: { createdAt: 'asc' },
@@ -422,36 +604,63 @@ export class ServiceRequestAllocationService {
       return { processed: 0, skipped: 0, details: [] };
     }
 
+    const activeRequestIds = activeRequests.map((r) => r.id);
+
+    // Preload active item counts and excluded domains to reduce N+1 queries.
+    const [activeItemCountsRaw, existingDomainRows] = await Promise.all([
+      this.prisma.allocationItem.groupBy({
+        by: ['requestId'],
+        where: {
+          requestId: { in: activeRequestIds },
+          status: {
+            in: [
+              AllocationItemStatus.NEW,
+              AllocationItemStatus.REGISTERING,
+              AllocationItemStatus.PROFILING,
+            ],
+          },
+        },
+        _count: { _all: true },
+      }),
+      this.prisma.allocationItem.findMany({
+        where: { requestId: { in: activeRequestIds } },
+        select: { requestId: true, domain: true },
+        distinct: ['requestId', 'domain'],
+      }),
+    ]);
+    const activeItemCountMap = new Map<string, number>(
+      activeItemCountsRaw.map((row) => [row.requestId || '', row._count._all])
+    );
+    const excludedDomainMap = new Map<string, Set<string>>();
+    for (const row of existingDomainRows) {
+      if (!row.requestId) continue;
+      if (!excludedDomainMap.has(row.requestId)) {
+        excludedDomainMap.set(row.requestId, new Set<string>());
+      }
+      excludedDomainMap.get(row.requestId)!.add(row.domain);
+    }
+
     // For each request, check if it needs re-allocation
-    const [multiplier, claimTimeout] = await Promise.all([
+    const [multiplier, claimTimeout, thresholdPercent] = await Promise.all([
       this.getAllocationMultiplier(),
       this.getClaimTimeout(),
+      this.getCompletionThresholdPercent(),
     ]);
 
     for (const request of activeRequests) {
       try {
         const config = request.config as Record<string, unknown> | null;
         const entityLimit = (config?.entityLimit as number) || 100;
+        const completionTarget = this.getCompletionTarget(entityLimit, thresholdPercent);
 
-        // Check if results are already sufficient
-        if (request.completedLinks >= entityLimit) {
+        // Check if results are already sufficient (using configurable threshold)
+        if (request.completedLinks >= completionTarget) {
           skipped++;
           continue;
         }
 
         // Count active items (still being processed or waiting to be claimed)
-        const activeItemCount = await this.prisma.allocationItem.count({
-          where: {
-            requestId: request.id,
-            status: {
-              in: [
-                AllocationItemStatus.NEW,
-                AllocationItemStatus.REGISTERING,
-                AllocationItemStatus.PROFILING,
-              ],
-            },
-          },
-        });
+        const activeItemCount = activeItemCountMap.get(request.id) || 0;
 
         // If there are still active items, no need to re-allocate yet
         if (activeItemCount > 0) {
@@ -459,8 +668,8 @@ export class ServiceRequestAllocationService {
           continue;
         }
 
-        // Calculate deficit: how many more successful results we need
-        const deficit = entityLimit - request.completedLinks;
+        // Calculate deficit: how many more successful results we need (based on completion target)
+        const deficit = calculateSupplementDeficit(completionTarget, request.completedLinks);
         if (deficit <= 0) {
           skipped++;
           continue;
@@ -472,12 +681,51 @@ export class ServiceRequestAllocationService {
         const lowTrafficTarget = targetCount - highTrafficTarget;
 
         // Get domains already allocated to this request (to exclude duplicates)
-        const existingDomains = await this.prisma.allocationItem.findMany({
-          where: { requestId: request.id },
-          select: { domain: true },
-          distinct: ['domain'],
-        });
-        const excludedDomains = new Set(existingDomains.map((d) => d.domain));
+        const excludedDomains = excludedDomainMap.get(request.id) || new Set<string>();
+
+        // Check availability before allocating new websites.
+        // If no websites available and request is RUNNING/RE_RUNNING, recycle failed items.
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        let availableWebsites = await this.getAvailableWebsitesOptimized(today, request.serviceType);
+        if (excludedDomains.size > 0) {
+          availableWebsites = availableWebsites.filter((w) => !excludedDomains.has(w.domain));
+        }
+
+        const noAvailableWebsites = availableWebsites.length === 0;
+        const canRecycleFailedItems =
+          request.status === RequestStatus.RUNNING || request.status === RequestStatus.RE_RUNNING;
+
+        if (noAvailableWebsites && canRecycleFailedItems) {
+          const recycleResult = await this.prisma.$transaction(async (tx) => {
+            return this.recycleFailedItemsForRequest(tx, request.id);
+          }, { timeout: 30000 });
+
+          if (recycleResult.recycledCount > 0) {
+            processed++;
+            details.push({
+              requestId: request.id,
+              deficit,
+              allocated: recycleResult.recycledCount, // Keep API shape; value represents recycled items
+            });
+
+            this.fastify.log.info({
+              requestId: request.id,
+              deficit,
+              recycledCount: recycleResult.recycledCount,
+              emailUpdatedCount: recycleResult.emailUpdatedCount,
+            }, 'No available websites - recycled FAIL_REGISTERING/FAIL_PROFILING items to NEW');
+          } else {
+            skipped++;
+            this.fastify.log.debug({
+              requestId: request.id,
+              deficit,
+            }, 'No available websites and no failed items to recycle');
+          }
+
+          continue;
+        }
 
         // Allocate in a transaction
         const result = await this.prisma.$transaction(async (tx) => {
@@ -569,17 +817,89 @@ export class ServiceRequestAllocationService {
   }
 
   /**
+   * Recycle failed items when no new websites are available.
+   * - FAIL_REGISTERING / FAIL_PROFILING -> NEW
+   * - claimedBy / claimedAt reset to null
+   * - For linkData.email: add one new dot while preserving existing dots
+   */
+  private async recycleFailedItemsForRequest(
+    tx: Prisma.TransactionClient,
+    requestId: string
+  ): Promise<{ recycledCount: number; emailUpdatedCount: number }> {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const failedItems = await tx.allocationItem.findMany({
+      where: {
+        requestId,
+        status: {
+          in: [AllocationItemStatus.FAIL_REGISTERING, AllocationItemStatus.FAIL_PROFILING],
+        },
+      },
+      select: {
+        id: true,
+        websiteId: true,
+        linkData: true,
+      },
+    });
+
+    if (failedItems.length === 0) {
+      return { recycledCount: 0, emailUpdatedCount: 0 };
+    }
+
+    let emailUpdatedCount = 0;
+
+    for (const item of failedItems) {
+      const updateData: Prisma.AllocationItemUpdateInput = {
+        status: AllocationItemStatus.NEW,
+        claimedBy: null,
+        claimedAt: null,
+        completedAt: null,
+        errorCode: null,
+        errorMessage: null,
+      };
+
+      const linkData = item.linkData as Record<string, unknown> | null;
+      if (linkData && typeof linkData === 'object' && typeof linkData.email === 'string') {
+        const oldEmail = linkData.email;
+        const newEmail = this.addOneDotPreserveExisting(oldEmail);
+        if (newEmail !== oldEmail) {
+          updateData.linkData = {
+            ...linkData,
+            email: newEmail,
+          };
+          emailUpdatedCount++;
+        }
+      }
+
+      await tx.allocationItem.update({
+        where: { id: item.id },
+        data: updateData,
+      });
+    }
+
+    // Recycle is a new allocation attempt for the same websites.
+    await this.batchUpsertDailyAllocations(tx, failedItems.map((i) => i.websiteId), today);
+
+    return {
+      recycledCount: failedItems.length,
+      emailUpdatedCount,
+    };
+  }
+
+  /**
    * Allocate websites for a specific request (OPTIMIZED version)
    * Uses pre-fetched configs and batched operations
    */
   private async allocateForRequestOptimized(
     request: ServiceRequest,
     multiplier: number,
-    claimTimeout: number
+    claimTimeout: number,
+    overrideEntityLimit?: number
   ): Promise<AllocationResult> {
-    // Get entityLimit from config
+    // Get entityLimit from config (or use override for supplement requests)
     const config = request.config as Record<string, unknown> | null;
-    const entityLimit = (config?.entityLimit as number) || 100;
+    const entityLimit = overrideEntityLimit || (config?.entityLimit as number) || 100;
 
     // Calculate targets
     const targetCount = Math.ceil(entityLimit * multiplier);
@@ -750,13 +1070,11 @@ export class ServiceRequestAllocationService {
     const highTrafficWebsites = availableWebsites.filter((w) => w.traffic >= TRAFFIC_THRESHOLD);
     const lowTrafficWebsites = availableWebsites.filter((w) => w.traffic < TRAFFIC_THRESHOLD);
 
-    // Sort by success rate (higher first)
-    highTrafficWebsites.sort((a, b) => b.successRate - a.successRate);
-    lowTrafficWebsites.sort((a, b) => b.successRate - a.successRate);
-
-    // Select websites
-    const selectedHigh = highTrafficWebsites.slice(0, highTrafficTarget);
-    const selectedLow = lowTrafficWebsites.slice(0, lowTrafficTarget);
+    // Select using Round-Robin + Weighted Random:
+    // 1. Sort by dailyCount ASC (least allocated first) for even distribution
+    // 2. Within same dailyCount tier, weighted random shuffle by successRate
+    const selectedHigh = this.selectWebsitesDistributed(highTrafficWebsites, highTrafficTarget);
+    const selectedLow = this.selectWebsitesDistributed(lowTrafficWebsites, lowTrafficTarget);
 
     // Combine
     const allSelected = [
@@ -765,19 +1083,39 @@ export class ServiceRequestAllocationService {
     ];
 
     if (allSelected.length > 0) {
+      // For accountType=multiple, apply Gmail dot trick to generate unique email per item
+      const shouldApplyDotTrick =
+        linkData.accountType === 'multiple' &&
+        typeof linkData.email === 'string' &&
+        linkData.email.includes('@');
+
+      let emailDotCount = 0;
+      if (shouldApplyDotTrick) {
+        emailDotCount = await this.getEmailDotCount();
+      }
+
       await tx.allocationItem.createMany({
-        data: allSelected.map((w) => ({
-          batchId,
-          requestId,
-          websiteId: w.id,
-          domain: w.domain,
-          serviceType,
-          trafficType: w.trafficType,
-          priorityScore: w.successRate,
-          status: AllocationItemStatus.NEW,
-          claimTimeout,
-          linkData: linkData as Prisma.InputJsonValue,
-        })),
+        data: allSelected.map((w) => {
+          let itemLinkData = linkData;
+          if (shouldApplyDotTrick && emailDotCount > 0) {
+            itemLinkData = {
+              ...linkData,
+              email: this.modifyEmailWithDots(linkData.email as string, emailDotCount),
+            };
+          }
+          return {
+            batchId,
+            requestId,
+            websiteId: w.id,
+            domain: w.domain,
+            serviceType,
+            trafficType: w.trafficType,
+            priorityScore: w.successRate,
+            status: AllocationItemStatus.NEW,
+            claimTimeout,
+            linkData: itemLinkData as Prisma.InputJsonValue,
+          };
+        }),
       });
 
       await this.batchUpsertDailyAllocations(tx, allSelected.map((w) => w.id), today);
@@ -795,6 +1133,95 @@ export class ServiceRequestAllocationService {
       highTrafficCount: selectedHigh.length,
       lowTrafficCount: selectedLow.length,
     };
+  }
+
+  /**
+   * Select websites using Round-Robin + Weighted Random distribution
+   *
+   * Algorithm:
+   * 1. Group websites by dailyCount (0, 1, 2)
+   * 2. Process groups from lowest dailyCount first (round-robin: least-used first)
+   * 3. Within each group, use weighted random selection based on successRate
+   *    â†’ websites with higher successRate have higher chance but are NOT guaranteed
+   * 4. Stop when we have enough websites or run out of candidates
+   *
+   * This ensures:
+   * - Websites with fewer daily allocations are prioritized (even distribution across requests)
+   * - Within the same usage tier, selection is randomized (avoids same top-N every time)
+   * - Higher successRate still gives an advantage (weighted, not pure random)
+   */
+  private selectWebsitesDistributed(
+    websites: WebsiteForAllocation[],
+    target: number
+  ): WebsiteForAllocation[] {
+    if (websites.length <= target) return [...websites];
+    if (target <= 0) return [];
+
+    // Group by dailyCount
+    const groups = new Map<number, WebsiteForAllocation[]>();
+    for (const w of websites) {
+      const group = groups.get(w.dailyCount) || [];
+      group.push(w);
+      groups.set(w.dailyCount, group);
+    }
+
+    // Sort group keys ascending (0, 1, 2) â†’ least allocated first
+    const sortedKeys = [...groups.keys()].sort((a, b) => a - b);
+
+    const selected: WebsiteForAllocation[] = [];
+
+    for (const key of sortedKeys) {
+      if (selected.length >= target) break;
+
+      const group = groups.get(key)!;
+      const remaining = target - selected.length;
+
+      if (group.length <= remaining) {
+        // Take all from this group
+        selected.push(...group);
+      } else {
+        // Weighted random selection from this group
+        const picked = this.weightedRandomPick(group, remaining);
+        selected.push(...picked);
+      }
+    }
+
+    return selected;
+  }
+
+  /**
+   * Weighted random pick: select `count` items from `pool`
+   * Weight = successRate + 1 (add 1 so websites with 0% still have a chance)
+   * Uses Fisher-Yates-like weighted sampling without replacement
+   */
+  private weightedRandomPick(
+    pool: WebsiteForAllocation[],
+    count: number
+  ): WebsiteForAllocation[] {
+    const candidates = [...pool];
+    const result: WebsiteForAllocation[] = [];
+
+    for (let i = 0; i < count && candidates.length > 0; i++) {
+      // Calculate total weight
+      const totalWeight = candidates.reduce((sum, w) => sum + w.successRate + 1, 0);
+
+      // Pick random weighted index
+      let rand = Math.random() * totalWeight;
+      let pickedIdx = 0;
+      for (let j = 0; j < candidates.length; j++) {
+        rand -= candidates[j].successRate + 1;
+        if (rand <= 0) {
+          pickedIdx = j;
+          break;
+        }
+      }
+
+      // Move picked item to result, remove from candidates
+      result.push(candidates[pickedIdx]);
+      candidates.splice(pickedIdx, 1);
+    }
+
+    return result;
   }
 
   /**
@@ -827,8 +1254,8 @@ export class ServiceRequestAllocationService {
       whereClause.types = { has: typeFilter as WebsiteType };
     }
 
-    // OPTIMIZATION: Run queries in parallel
-    const [websites, dailyAllocations, statsRecords] = await Promise.all([
+    // OPTIMIZATION: Run base queries in parallel
+    const [websites, dailyAllocations] = await Promise.all([
       // Query 1: Get websites
       this.prisma.website.findMany({
         where: whereClause,
@@ -839,18 +1266,33 @@ export class ServiceRequestAllocationService {
         where: { date },
         select: { websiteId: true, allocationCount: true },
       }),
-      // Query 3: Get success rates (will filter by websiteIds after)
-      this.prisma.websiteStats.findMany({
-        where: { periodType: 'MONTHLY' },
-        orderBy: { periodStart: 'desc' },
-        distinct: ['websiteId'],
-        select: { websiteId: true, successRate: true },
-      }),
     ]);
 
     // Build lookup maps
     const allocationMap = new Map(dailyAllocations.map((d) => [d.websiteId, d.allocationCount]));
-    const statsMap = new Map(statsRecords.map((s) => [s.websiteId, s.successRate]));
+
+    // Use daily_allocations as the single source of truth for success rate.
+    const websiteIds = websites.map((w) => w.id);
+    const allocationHistory = websiteIds.length > 0
+      ? await this.prisma.dailyAllocation.groupBy({
+          by: ['websiteId'],
+          where: { websiteId: { in: websiteIds } },
+          _sum: {
+            allocationCount: true,
+            successCount: true,
+          },
+        })
+      : [];
+    const statsMap = new Map(
+      allocationHistory.map((row) => {
+        const allocations = row._sum.allocationCount || 0;
+        const success = row._sum.successCount || 0;
+        const successRate = allocations > 0
+          ? Math.round((success / allocations) * 100 * 100) / 100
+          : 0;
+        return [row.websiteId, successRate] as const;
+      })
+    );
 
     // Filter and transform
     const result = websites
@@ -865,6 +1307,7 @@ export class ServiceRequestAllocationService {
           domain: w.domain,
           traffic: (metrics?.traffic as number) || 0,
           successRate: statsMap.get(w.id) || 0,
+          dailyCount: allocationMap.get(w.id) || 0,
         };
       });
 
@@ -887,18 +1330,7 @@ export class ServiceRequestAllocationService {
     websiteIds: string[],
     date: Date
   ): Promise<void> {
-    if (websiteIds.length === 0) return;
-
-    const dateStr = date.toISOString().split('T')[0];
-
-    await tx.$executeRaw`
-      INSERT INTO daily_allocations (id, "websiteId", date, "allocationCount", "updatedAt")
-      SELECT gen_random_uuid(), unnest(${websiteIds}::text[]), ${dateStr}::date, 1, NOW()
-      ON CONFLICT ("websiteId", date)
-      DO UPDATE SET
-        "allocationCount" = daily_allocations."allocationCount" + 1,
-        "updatedAt" = NOW()
-    `;
+    await this.allocationMetrics.incrementAttempts(tx, websiteIds, date);
   }
 
   /**
@@ -926,8 +1358,8 @@ export class ServiceRequestAllocationService {
    * 3. Single atomic UPDATE - claim and update in one query
    *
    * Status flow:
-   * - NEW tasks → REGISTERING (tool will do registration/profiling)
-   * - CONNECTING tasks → CONNECTING (tool will do stacking, status remains CONNECTING)
+   * - NEW tasks â†’ REGISTERING (tool will do registration/profiling)
+   * - CONNECTING tasks â†’ CONNECTING (tool will do stacking, status remains CONNECTING)
    *
    * Tool type logic (from tools table):
    * - GLOBAL: Claim all available tasks (idTool is NULL or matches toolId)
@@ -1068,7 +1500,7 @@ export class ServiceRequestAllocationService {
         updated AS (
           UPDATE allocation_items ai
           SET
-            -- NEW tasks → REGISTERING, CONNECTING tasks stay CONNECTING (for stacking)
+            -- NEW tasks â†’ REGISTERING, CONNECTING tasks stay CONNECTING (for stacking)
             -- Cast to AllocationItemStatus enum for PostgreSQL
             status = CASE
               WHEN li.prev_status = 'CONNECTING'::"AllocationItemStatus" THEN 'CONNECTING'::"AllocationItemStatus"
@@ -1144,96 +1576,7 @@ export class ServiceRequestAllocationService {
    * - Items with retryIndex >= 3: Mark as FAILED (max retries exceeded)
    */
   async releaseExpiredClaims(): Promise<number> {
-    const MAX_RETRIES = 1;
-
-    // Query 1a: Reset REGISTERING/PROFILING items back to NEW (retry)
-    const releasedToNew = await this.prisma.$executeRaw`
-      UPDATE allocation_items
-      SET
-        status = 'NEW',
-        "claimedBy" = NULL,
-        "claimedAt" = NULL,
-        "retryIndex" = "retryIndex" + 1
-      WHERE
-        status IN ('REGISTERING', 'PROFILING')
-        AND "claimedAt" IS NOT NULL
-        AND "claimedAt" + ("claimTimeout" * interval '1 minute') < NOW()
-        AND "retryIndex" < ${MAX_RETRIES}
-    `;
-
-    // Query 1b: Reset CONNECTING items back to CONNECTING with claimedBy=NULL (retry)
-    // Keep CONNECTING status so tools can re-claim for stacking phase
-    const releasedConnecting = await this.prisma.$executeRaw`
-      UPDATE allocation_items
-      SET
-        "claimedBy" = NULL,
-        "claimedAt" = NULL,
-        "retryIndex" = "retryIndex" + 1
-      WHERE
-        status = 'CONNECTING'
-        AND "claimedAt" IS NOT NULL
-        AND "claimedAt" + ("claimTimeout" * interval '1 minute') < NOW()
-        AND "retryIndex" < ${MAX_RETRIES}
-    `;
-
-    // Query 2: Mark items that exceeded max retries as FAILED
-    const markedFailed = await this.prisma.$executeRaw`
-      UPDATE allocation_items
-      SET
-        status = 'FAILED',
-        "errorCode" = 'MAX_RETRIES_EXCEEDED',
-        "errorMessage" = 'Task failed after ' || ("retryIndex" + 1) || ' retries (timeout)',
-        "completedAt" = NOW()
-      WHERE
-        status IN ('REGISTERING', 'PROFILING', 'CONNECTING')
-        AND "claimedAt" IS NOT NULL
-        AND "claimedAt" + ("claimTimeout" * interval '1 minute') < NOW()
-        AND "retryIndex" >= ${MAX_RETRIES}
-    `;
-
-    if (releasedToNew > 0) {
-      this.fastify.log.info({ count: releasedToNew }, 'Released expired claims back to NEW (retryIndex incremented)');
-    }
-
-    if (releasedConnecting > 0) {
-      this.fastify.log.info({ count: releasedConnecting }, 'Released expired CONNECTING claims (claimedBy reset, status kept CONNECTING)');
-    }
-
-    if (markedFailed > 0) {
-      this.fastify.log.warn({ count: markedFailed }, 'Marked expired claims as FAILED (max retries exceeded)');
-
-      // Update failedLinks count for affected requests
-      await this.updateFailedLinksForExpiredItems(markedFailed);
-    }
-
-    return releasedToNew + releasedConnecting + markedFailed;
-  }
-
-  /**
-   * Update failedLinks count for requests that have items marked as FAILED due to max retries
-   */
-  private async updateFailedLinksForExpiredItems(count: number): Promise<void> {
-    if (count === 0) return;
-
-    try {
-      // Get requestIds of recently failed items and update their failedLinks count
-      await this.prisma.$executeRaw`
-        UPDATE service_requests sr
-        SET "failedLinks" = "failedLinks" + subq.failed_count
-        FROM (
-          SELECT ab."requestId", COUNT(*) as failed_count
-          FROM allocation_items ai
-          INNER JOIN allocation_batches ab ON ab.id = ai."batchId"
-          WHERE ai.status = 'FAILED'
-            AND ai."errorCode" = 'MAX_RETRIES_EXCEEDED'
-            AND ai."completedAt" > NOW() - interval '1 minute'
-          GROUP BY ab."requestId"
-        ) subq
-        WHERE sr.id = subq."requestId"
-      `;
-    } catch (error) {
-      this.fastify.log.error({ error }, 'Failed to update failedLinks for expired items');
-    }
+    return this.releaseExpiredClaimsUseCase.execute();
   }
 
   // ==================== REQUEST TIMEOUT ====================
@@ -1256,117 +1599,11 @@ export class ServiceRequestAllocationService {
    * If no items have been claimed yet, the request is skipped (still waiting for tools).
    */
   async timeoutExpiredRequests(): Promise<{ timedOut: number; cancelledItems: number }> {
-    const completionTimePer100 = await this.getRequestCompletionTimePer100();
-    let timedOut = 0;
-    let cancelledItems = 0;
-
-    // Find RUNNING requests with the earliest claimedAt from their items
-    const runningRequests = await this.prisma.serviceRequest.findMany({
-      where: {
-        status: RequestStatus.RUNNING,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-        config: true,
-      },
-    });
-
-    if (runningRequests.length === 0) {
-      return { timedOut: 0, cancelledItems: 0 };
-    }
-
-    // Get the earliest claimedAt for each request (= when tool started processing)
-    const requestIds = runningRequests.map((r) => r.id);
-    const earliestClaims = await this.prisma.$queryRaw<
-      Array<{ requestId: string; earliestClaimedAt: Date }>
-    >`
-      SELECT ab."requestId" as "requestId", MIN(ai."claimedAt") as "earliestClaimedAt"
-      FROM allocation_items ai
-      JOIN allocation_batches ab ON ai."batchId" = ab.id
-      WHERE ab."requestId" IN (${Prisma.join(requestIds)})
-        AND ai."claimedAt" IS NOT NULL
-      GROUP BY ab."requestId"
-    `;
-
-    const claimTimeMap = new Map(
-      earliestClaims.map((r) => [r.requestId, r.earliestClaimedAt])
+    return this.timeoutExpiredRequestsUseCase.execute(
+      () => this.getRequestCompletionTimePer100(),
+      (entityLimit, completionTimePer100) =>
+        this.calculateRequestTimeout(entityLimit, completionTimePer100)
     );
-
-    const now = new Date();
-
-    for (const request of runningRequests) {
-      const startTime = claimTimeMap.get(request.id);
-      if (!startTime) {
-        // No items claimed yet = tool hasn't started processing, skip
-        continue;
-      }
-
-      // Get entityLimit from config
-      const config = request.config as Record<string, unknown> | null;
-      const entityLimit = (config?.entityLimit as number) || 100;
-
-      // Calculate timeout
-      const timeoutMinutes = this.calculateRequestTimeout(entityLimit, completionTimePer100);
-      const timeoutMs = timeoutMinutes * 60 * 1000;
-
-      // Check if request has expired (from first claim time)
-      const elapsedMs = now.getTime() - startTime.getTime();
-      if (elapsedMs < timeoutMs) {
-        continue; // Not expired yet
-      }
-
-      try {
-        // Use transaction to update request and cancel items atomically
-        const result = await this.prisma.$transaction(async (tx) => {
-          // Cancel all pending/processing items for this request
-          const cancelled = await tx.$executeRaw`
-            UPDATE allocation_items ai
-            SET
-              status = 'CANCEL',
-              "errorCode" = 'REQUEST_TIMEOUT',
-              "errorMessage" = 'Request timed out after ' || ${timeoutMinutes} || ' minutes',
-              "completedAt" = NOW()
-            FROM allocation_batches ab
-            WHERE ai."batchId" = ab.id
-              AND ab."requestId" = ${request.id}
-              AND ai.status IN ('NEW', 'REGISTERING', 'PROFILING', 'CONNECTING')
-          `;
-
-          // Update request status to COMPLETED
-          await tx.serviceRequest.update({
-            where: { id: request.id },
-            data: {
-              status: RequestStatus.COMPLETED,
-              progressPercent: 100,
-            },
-          });
-
-          return cancelled;
-        });
-
-        timedOut++;
-        cancelledItems += result;
-
-        this.fastify.log.warn({
-          requestId: request.id,
-          entityLimit,
-          timeoutMinutes,
-          startedAt: startTime.toISOString(),
-          elapsedMinutes: Math.round(elapsedMs / 60000),
-          cancelledItems: result,
-        }, 'Request timed out - marked as COMPLETED and cancelled pending items');
-
-      } catch (error) {
-        this.fastify.log.error({ error, requestId: request.id }, 'Failed to timeout request');
-      }
-    }
-
-    if (timedOut > 0) {
-      this.fastify.log.info({ timedOut, cancelledItems }, 'Timed out expired requests');
-    }
-
-    return { timedOut, cancelledItems };
   }
 
   /**
@@ -1398,120 +1635,137 @@ export class ServiceRequestAllocationService {
       externalLinkId?: string;
     }
   ): Promise<{ success: boolean; message?: string; item?: unknown }> {
-    // Find the item first with batch to get requestId and existing linkData for merge
-    const item = await this.prisma.allocationItem.findUnique({
-      where: { id: itemId },
-      select: {
-        id: true,
-        status: true,
-        linkData: true,
-        batch: { select: { requestId: true } },
-      },
-    });
-
-    if (!item) {
-      return { success: false, message: 'Task not found' };
-    }
-
-    // Build update data
-    const updateData: Record<string, unknown> = {
-      status: data.status,
-    };
-
-    if (data.linkProfile !== undefined) {
-      updateData.linkProfile = data.linkProfile;
-    }
-    if (data.linkPost !== undefined) {
-      updateData.linkPost = data.linkPost;
-    }
-    if (data.note !== undefined) {
-      updateData.note = data.note;
-    }
-    if (data.errorCode !== undefined) {
-      updateData.errorCode = data.errorCode;
-    }
-    if (data.errorMessage !== undefined) {
-      updateData.errorMessage = data.errorMessage;
-    }
-
-    // Extended fields
-    if (data.linkData !== undefined) {
-      // MERGE behavior: only update specified keys, keep existing keys
-      const existingLinkData = (item.linkData as Record<string, unknown>) || {};
-      updateData.linkData = { ...existingLinkData, ...data.linkData };
-    }
-    if (data.claimedBy !== undefined) {
-      updateData.claimedBy = data.claimedBy;
-    }
-    if (data.claimedAt !== undefined) {
-      // claimedAt can be null to clear, or ISO date string
-      updateData.claimedAt = data.claimedAt === null ? null : new Date(data.claimedAt);
-    }
-    if (data.claimTimeout !== undefined) {
-      updateData.claimTimeout = data.claimTimeout;
-    }
-    if (data.retryIndex !== undefined) {
-      updateData.retryIndex = data.retryIndex;
-    }
-    if (data.linkStatus !== undefined) {
-      updateData.linkStatus = data.linkStatus;
-    }
-    if (data.externalLinkId !== undefined) {
-      updateData.externalLinkId = data.externalLinkId;
-    }
-
-    // Set completedAt if status is terminal
-    const terminalStatuses: AllocationItemStatus[] = [
-      AllocationItemStatus.FINISH,
-      AllocationItemStatus.FAILED,
-      AllocationItemStatus.CANCEL,
-      AllocationItemStatus.FAIL_REGISTERING,
-      AllocationItemStatus.FAIL_PROFILING,
-      AllocationItemStatus.FAIL_CONNECTING,
-    ];
-    if (terminalStatuses.includes(data.status)) {
-      updateData.completedAt = new Date();
-    }
-
-    // Update the item
-    const updated = await this.prisma.allocationItem.update({
-      where: { id: itemId },
-      data: updateData,
-      select: {
-        id: true,
-        status: true,
-        domain: true,
-        linkProfile: true,
-        linkPost: true,
-        linkData: true,
-        note: true,
-        errorCode: true,
-        errorMessage: true,
-        claimedBy: true,
-        claimedAt: true,
-        claimTimeout: true,
-        retryIndex: true,
-        linkStatus: true,
-        externalLinkId: true,
-      },
-    });
-
-    this.fastify.log.info({
-      itemId,
-      oldStatus: item.status,
-      newStatus: data.status,
-      linkDataMerged: data.linkData !== undefined,
-    }, 'Task status updated directly');
-
-    // If status changed to terminal, update request progress
-    const requestId = item.batch?.requestId;
-    if (terminalStatuses.includes(data.status) && requestId) {
-      this.updateRequestProgressOptimized(this.prisma, requestId).catch((err) => {
-        this.fastify.log.warn({ err, requestId }, 'Failed to update request progress after status update');
+    const result = await this.prisma.$transaction(async (tx) => {
+      // Find the item first with batch to get requestId and existing linkData for merge
+      const item = await tx.allocationItem.findUnique({
+        where: { id: itemId },
+        select: {
+          id: true,
+          status: true,
+          websiteId: true,
+          allocatedAt: true,
+          completedAt: true,
+          linkProfile: true,
+          linkData: true,
+          batch: { select: { requestId: true } },
+        },
       });
-    }
 
-    return { success: true, item: updated };
+      if (!item) {
+        return { success: false, message: 'Task not found' };
+      }
+
+      // Build update data
+      const updateData: Record<string, unknown> = {
+        status: data.status,
+      };
+
+      if (data.linkProfile !== undefined) {
+        updateData.linkProfile = data.linkProfile;
+      }
+      if (data.linkPost !== undefined) {
+        updateData.linkPost = data.linkPost;
+      }
+      if (data.note !== undefined) {
+        updateData.note = data.note;
+      }
+      if (data.errorCode !== undefined) {
+        updateData.errorCode = data.errorCode;
+      }
+      if (data.errorMessage !== undefined) {
+        updateData.errorMessage = data.errorMessage;
+      }
+
+      // Extended fields
+      if (data.linkData !== undefined) {
+        // MERGE behavior: only update specified keys, keep existing keys
+        const existingLinkData = (item.linkData as Record<string, unknown>) || {};
+        updateData.linkData = { ...existingLinkData, ...data.linkData };
+      }
+      if (data.claimedBy !== undefined) {
+        updateData.claimedBy = data.claimedBy;
+      }
+      if (data.claimedAt !== undefined) {
+        // claimedAt can be null to clear, or ISO date string
+        updateData.claimedAt = data.claimedAt === null ? null : new Date(data.claimedAt);
+      }
+      if (data.claimTimeout !== undefined) {
+        updateData.claimTimeout = data.claimTimeout;
+      }
+      if (data.retryIndex !== undefined) {
+        updateData.retryIndex = data.retryIndex;
+      }
+      if (data.linkStatus !== undefined) {
+        updateData.linkStatus = data.linkStatus;
+      }
+      if (data.externalLinkId !== undefined) {
+        updateData.externalLinkId = data.externalLinkId;
+      }
+
+      // Set completedAt if status is terminal
+      if (TERMINAL_STATUSES.includes(data.status)) {
+        updateData.completedAt = new Date();
+      }
+
+      // Update the item
+      const updated = await tx.allocationItem.update({
+        where: { id: itemId },
+        data: updateData,
+        select: {
+          id: true,
+          status: true,
+          domain: true,
+          linkProfile: true,
+          linkPost: true,
+          linkData: true,
+          note: true,
+          errorCode: true,
+          errorMessage: true,
+          claimedBy: true,
+          claimedAt: true,
+          claimTimeout: true,
+          retryIndex: true,
+          linkStatus: true,
+          externalLinkId: true,
+        },
+      });
+
+      this.fastify.log.info({
+        itemId,
+        oldStatus: item.status,
+        newStatus: data.status,
+        linkDataMerged: data.linkData !== undefined,
+      }, 'Task status updated directly');
+
+      const requestId = item.batch?.requestId;
+      const shouldCountResult =
+        TERMINAL_STATUSES.includes(data.status) && shouldCountOnce(item.completedAt);
+      const effectiveLinkProfile =
+        data.linkProfile !== undefined ? data.linkProfile : item.linkProfile;
+      const hasLinkProfile = isSuccessByProfile(effectiveLinkProfile);
+
+      // Sync counters/stats for terminal transitions (count exactly once per item)
+      if (requestId && shouldCountResult) {
+        await this.allocationMetrics.recordTerminalResult(tx, {
+          requestId,
+          websiteId: item.websiteId,
+          allocatedAt: item.allocatedAt,
+          prevStatus: item.status,
+          nextStatus: data.status,
+          errorCode: data.errorCode,
+          isSuccess: hasLinkProfile,
+        });
+      }
+
+      // If status changed to terminal, update request progress in same transaction
+      if (TERMINAL_STATUSES.includes(data.status) && requestId) {
+        await this.updateRequestProgressOptimized(tx, requestId);
+      }
+
+      return { success: true, item: updated };
+    });
+
+    return result;
   }
 
   /**
@@ -1519,8 +1773,8 @@ export class ServiceRequestAllocationService {
    *
    * Status determination logic when task has linkProfile (profiling step completed):
    * - If request.status is RUNNING or COMPLETED AND entityConnect !== 'disable'
-   *   → Set task status to CONNECTING (tool will claim again for stacking)
-   * - Otherwise → Set task status to FINISH
+   *   â†’ Set task status to CONNECTING (tool will claim again for stacking)
+   * - Otherwise â†’ Set task status to FINISH
    *
    * This allows tasks to go through stacking phase based on entityConnect config
    */
@@ -1534,174 +1788,18 @@ export class ServiceRequestAllocationService {
       errorMessage?: string;
     }
   ): Promise<{ success: boolean; message?: string }> {
-    return this.prisma.$transaction(async (tx) => {
-      // Get item with batch info and request details for entityConnect check
-      const item = await tx.allocationItem.findUnique({
-        where: { id: itemId },
-        select: {
-          id: true,
-          status: true,
-          websiteId: true,
-          domain: true,
-          serviceType: true,
-          externalLinkId: true,
-          batch: {
-            select: {
-              requestId: true,
-              request: {
-                select: {
-                  status: true,
-                  config: true,
-                },
-              },
-            },
-          },
-        },
-      });
-
-      if (!item) {
-        return { success: false, message: 'Task not found' };
-      }
-
-      // Check if item is in a processing state (REGISTERING, PROFILING, CONNECTING)
-      const isProcessing =
-        item.status === AllocationItemStatus.REGISTERING ||
-        item.status === AllocationItemStatus.PROFILING ||
-        item.status === AllocationItemStatus.CONNECTING;
-      if (!isProcessing) {
-        return { success: false, message: `Task is not in processing state (current status: ${item.status})` };
-      }
-
-      // Determine the new status based on result and entityConnect config
-      let newStatus: AllocationItemStatus;
-
-      if (!result.success) {
-        // Failed tasks always go to FAILED status
-        newStatus = AllocationItemStatus.FAILED;
-      } else if (result.linkProfile && item.batch?.request) {
-        // Task completed profiling step (has linkProfile)
-        // Check if we need stacking (entityConnect logic)
-        const request = item.batch.request;
-        const config = request.config as Record<string, unknown> | null;
-        const entityConnect = (config?.entityConnect as string) || 'disable';
-
-        // entityConnect logic:
-        // - 'disable': No stacking needed → FINISH
-        // - 'custom': Stack immediately after profiling → CONNECTING (tool can claim)
-        // - 'all': Wait until linkProfile count >= entityLimit → CONNECT (waiting for threshold)
-        // - 'limit': Wait until linkProfile count >= limit value → CONNECT (waiting for threshold)
-        // Request is active if it's PENDING, RUNNING, or COMPLETED
-        // Note: PENDING is included because claimTasks updates status to RUNNING asynchronously (fire-and-forget)
-        // so when completeTask runs, request may still be PENDING
-        const requestIsActive =
-          request.status === RequestStatus.PENDING ||
-          request.status === RequestStatus.RUNNING ||
-          request.status === RequestStatus.COMPLETED;
-
-        if (!requestIsActive || entityConnect === 'disable') {
-          // No stacking needed
-          newStatus = AllocationItemStatus.FINISH;
-        } else if (entityConnect === 'custom') {
-          // Can stack immediately after profiling - tool can claim for stacking
-          newStatus = AllocationItemStatus.CONNECTING;
-          this.fastify.log.debug({
-            itemId,
-            entityConnect,
-          }, 'Task moving to CONNECTING (ready for stacking - custom mode)');
-        } else {
-          // entityConnect is 'all' or 'limit' - need to wait for threshold
-          // Monitor Job will change CONNECT → CONNECTING when threshold is met
-          newStatus = 'CONNECT' as AllocationItemStatus;
-          this.fastify.log.debug({
-            itemId,
-            entityConnect,
-          }, 'Task moving to CONNECT (waiting for threshold - all/limit mode)');
-        }
-      } else {
-        // Success but no linkProfile (or no request context) → FINISH
-        newStatus = AllocationItemStatus.FINISH;
-      }
-
-      const now = new Date();
-      const today = new Date(now);
-      today.setHours(0, 0, 0, 0);
-
-      // Task is considered "completed" when profiling is done (has linkProfile)
-      // CONNECT = waiting for stacking threshold, CONNECTING = ready for stacking
-      // Both mean profiling is done, so count as completed for progress tracking
-      const isTaskCompleted =
-        newStatus === AllocationItemStatus.FINISH ||
-        newStatus === AllocationItemStatus.FAILED ||
-        (newStatus === AllocationItemStatus.CONNECTING && result.linkProfile) ||
-        (newStatus === AllocationItemStatus.CONNECT && result.linkProfile);
-
-      // OPTIMIZATION: Update item, request progress, and daily stats in parallel
-      const updatePromises: Promise<unknown>[] = [
-        // Update allocation item
-        tx.allocationItem.update({
-          where: { id: itemId },
-          data: {
-            status: newStatus,
-            linkProfile: result.linkProfile,
-            linkPost: result.linkPost,
-            errorCode: result.errorCode,
-            errorMessage: result.errorMessage,
-            // Set completedAt when profiling is done (CONNECT/CONNECTING with linkProfile, FINISH, FAILED)
-            ...(isTaskCompleted && { completedAt: now }),
-            // Reset claimedBy/claimedAt when moving to CONNECTING or CONNECT
-            // so another tool can claim this item for the stacking phase
-            ...(newStatus === AllocationItemStatus.CONNECTING && { claimedBy: null, claimedAt: null }),
-            ...(newStatus === AllocationItemStatus.CONNECT && { claimedBy: null, claimedAt: null }),
-            resultSyncedAt: now,
-          },
-        }),
-      ];
-
-      // Update request progress and daily stats when profiling is done
-      // CONNECT/CONNECTING with linkProfile counts as completed (stacking is just bonus step)
-      if (item.batch?.requestId && isTaskCompleted) {
-        const incrementField = result.success ? 'completedLinks' : 'failedLinks';
-        updatePromises.push(
-          tx.serviceRequest.update({
-            where: { id: item.batch.requestId },
-            data: { [incrementField]: { increment: 1 } },
-          })
-        );
-
-        // Update daily stats
-        updatePromises.push(
-          tx.dailyAllocation.upsert({
-            where: { websiteId_date: { websiteId: item.websiteId, date: today } },
-            create: {
-              websiteId: item.websiteId,
-              date: today,
-              successCount: result.success ? 1 : 0,
-              failureCount: result.success ? 0 : 1,
-            },
-            update: result.success
-              ? { successCount: { increment: 1 } }
-              : { failureCount: { increment: 1 } },
-          })
-        );
-      }
-
-      await Promise.all(updatePromises);
-
-      // Update progress percent and check completion when task is completed
-      if (item.batch?.requestId && isTaskCompleted) {
-        await this.updateRequestProgressOptimized(tx, item.batch.requestId);
-      }
-
-      return { success: true };
-    }, {
-      timeout: 10000,
-    });
+    return this.completeTaskUseCase.execute(
+      itemId,
+      result,
+      (tx, requestId) => this.updateRequestProgressOptimized(tx, requestId)
+    );
   }
 
   /**
    * Update request progress - OPTIMIZED
    *
-   * Also auto-cancels remaining NEW items when completedLinks >= entityLimit.
+   * Also auto-cancels remaining NEW items when completedLinks >= completionTarget.
+   * completionTarget = entityLimit * COMPLETION_THRESHOLD_PERCENT / 100 (configurable).
    * Tools that are already processing (REGISTERING, PROFILING, CONNECTING) will
    * finish their current work, but no new items will be claimed.
    */
@@ -1716,9 +1814,9 @@ export class ServiceRequestAllocationService {
 
     if (!request) return;
 
-    const total = request.totalLinks;
+    let total = request.totalLinks;
     const completed = request.completedLinks + request.failedLinks;
-    const progressPercent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
+    let progressPercent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
 
     const updateData: Prisma.ServiceRequestUpdateInput = { progressPercent };
 
@@ -1727,34 +1825,68 @@ export class ServiceRequestAllocationService {
       updateData.status = RequestStatus.COMPLETED;
     }
 
-    // Auto-cancel NEW items when completedLinks reaches entityLimit
+    // Auto-cancel NEW items when completedLinks reaches completion target (configurable threshold)
     // Tools already processing (REGISTERING, PROFILING, CONNECTING) will finish their work
     const config = request.config as Record<string, unknown> | null;
     const entityLimit = (config?.entityLimit as number) || 100;
+    const thresholdPercent = await this.getCompletionThresholdPercent();
+    const completionTarget = this.getCompletionTarget(entityLimit, thresholdPercent);
 
-    if (request.completedLinks >= entityLimit) {
-      const cancelledCount = await tx.allocationItem.updateMany({
-        where: {
-          requestId,
-          status: AllocationItemStatus.NEW,
-        },
-        data: {
-          status: AllocationItemStatus.CANCEL,
-          errorCode: 'TARGET_REACHED',
-          errorMessage: `Request reached target (${request.completedLinks}/${entityLimit})`,
-          completedAt: new Date(),
-        },
-      });
+    if (request.completedLinks >= completionTarget) {
+      const cancelMessage = `Request reached target (${request.completedLinks}/${completionTarget})`;
+      const cancelledRows = await tx.$queryRaw<Array<{ cancelledCount: bigint }>>`
+        WITH cancelled AS (
+          UPDATE allocation_items ai
+          SET
+            status = 'CANCEL'::"AllocationItemStatus",
+            "errorCode" = 'TARGET_REACHED',
+            "errorMessage" = ${cancelMessage},
+            "completedAt" = NOW()
+          WHERE
+            ai."requestId" = ${requestId}
+            AND ai.status = 'NEW'::"AllocationItemStatus"
+            AND ai."completedAt" IS NULL
+          RETURNING ai."websiteId", DATE(ai."allocatedAt") AS alloc_date
+        ),
+        agg AS (
+          SELECT "websiteId", alloc_date, COUNT(*)::int AS cnt
+          FROM cancelled
+          GROUP BY "websiteId", alloc_date
+        ),
+        updated_allocations AS (
+          UPDATE daily_allocations da
+          SET
+            "allocationCount" = GREATEST(0, da."allocationCount" - agg.cnt),
+            "updatedAt" = NOW()
+          FROM agg
+          WHERE
+            da."websiteId" = agg."websiteId"
+            AND da.date = agg.alloc_date
+          RETURNING 1
+        )
+        SELECT COUNT(*)::bigint AS "cancelledCount"
+        FROM cancelled
+      `;
 
-      if (cancelledCount.count > 0) {
+      const cancelledCount = Number(cancelledRows[0]?.cancelledCount || 0);
+
+      if (cancelledCount > 0) {
         // Adjust totalLinks down so progress percent stays accurate
-        updateData.totalLinks = { decrement: cancelledCount.count };
+        updateData.totalLinks = { decrement: cancelledCount };
+        total = Math.max(0, total - cancelledCount);
+        progressPercent = total > 0 ? Math.min(100, (completed / total) * 100) : 0;
+        updateData.progressPercent = progressPercent;
+        if (completed >= total && progressPercent >= 100) {
+          updateData.status = RequestStatus.COMPLETED;
+        }
         this.fastify.log.info({
           requestId,
           completedLinks: request.completedLinks,
+          completionTarget,
           entityLimit,
-          cancelledNewItems: cancelledCount.count,
-        }, `Auto-cancelled ${cancelledCount.count} NEW items - target reached`);
+          thresholdPercent,
+          cancelledNewItems: cancelledCount,
+        }, `Auto-cancelled ${cancelledCount} NEW items - target reached`);
       }
     }
 
@@ -2025,7 +2157,7 @@ export class ServiceRequestAllocationService {
    * - Requests with entityConnect = 'all': Check if linkProfile count >= entityLimit
    * - Requests with entityConnect = 'limit': Check if linkProfile count >= limit value in config
    *
-   * When threshold is met, change status from CONNECT → CONNECTING
+   * When threshold is met, change status from CONNECT â†’ CONNECTING
    * so tasks can be claimed by tools for stacking phase.
    *
    * Status flow:
@@ -2109,7 +2241,7 @@ export class ServiceRequestAllocationService {
 
       // Check if threshold is met
       if (linkProfileCount >= threshold) {
-        // Change status from CONNECT → CONNECTING for all tasks of this request
+        // Change status from CONNECT â†’ CONNECTING for all tasks of this request
         const updated = await this.prisma.$executeRaw`
           UPDATE allocation_items ai
           SET status = 'CONNECTING'
@@ -2135,7 +2267,7 @@ export class ServiceRequestAllocationService {
             threshold,
             linkProfileCount,
             updatedItems: updated,
-          }, 'Triggered stacking for request - threshold reached, CONNECT → CONNECTING');
+          }, 'Triggered stacking for request - threshold reached, CONNECT â†’ CONNECTING');
         }
       }
     }
@@ -2145,6 +2277,126 @@ export class ServiceRequestAllocationService {
     }
 
     return { triggered, updatedItems, details };
+  }
+
+  // ==================== AUTO-DETECT COMPLETED â†’ RE_RUN ====================
+
+  /**
+   * Check COMPLETED requests that haven't met their target and transition to RE_RUN
+   *
+   * Logic:
+   * 1. Find COMPLETED requests where completedLinks < completionTarget
+   * 2. If retryCount >= MAX_SUPPLEMENT_RETRIES (2) â†’ skip (already retried enough)
+   * 3. Otherwise â†’ set status=RE_RUN, idTool=null, retryCount++
+   * 4. autoAssignTools will then assign a RE_RUNNING tool pair
+   * 5. processSupplementRequests will allocate deficit websites
+   */
+  async checkCompletedForReRun(): Promise<{
+    transitioned: number;
+    skipped: number;
+    maxRetriesReached: number;
+  }> {
+    let transitioned = 0;
+    let skipped = 0;
+    let maxRetriesReached = 0;
+
+    const thresholdPercent = await this.getCompletionThresholdPercent();
+
+    // Find COMPLETED requests (not deleted)
+    const completedRequests = await this.prisma.serviceRequest.findMany({
+      where: {
+        status: RequestStatus.COMPLETED,
+        deletedAt: null,
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: 50,
+    });
+
+    if (completedRequests.length === 0) {
+      return { transitioned: 0, skipped: 0, maxRetriesReached: 0 };
+    }
+
+    for (const request of completedRequests) {
+      const config = request.config as Record<string, unknown> | null;
+      const entityLimit = (config?.entityLimit as number) || 100;
+      const completionTarget = this.getCompletionTarget(entityLimit, thresholdPercent);
+
+      // Check if target is met
+      if (request.completedLinks >= completionTarget) {
+        skipped++;
+        continue;
+      }
+
+      // Check run count limit
+      if (request.runCount >= MAX_SUPPLEMENT_RETRIES) {
+        maxRetriesReached++;
+        continue;
+      }
+
+      // Transition COMPLETED â†’ RE_RUN
+      try {
+        await this.prisma.serviceRequest.update({
+          where: { id: request.id },
+          data: {
+            status: RequestStatus.RE_RUN,
+            idTool: null, // Reset so autoAssignTools assigns a RE_RUNNING tool
+            runCount: { increment: 1 },
+            retryCount: { increment: 1 },
+          },
+        });
+
+        transitioned++;
+        this.fastify.log.info(
+          {
+            requestId: request.id,
+            completedLinks: request.completedLinks,
+            completionTarget,
+            runCount: request.runCount + 1,
+            retryCount: request.retryCount + 1,
+          },
+          `COMPLETED â†’ RE_RUN (retry ${request.retryCount + 1}/${MAX_SUPPLEMENT_RETRIES})`
+        );
+      } catch (error) {
+        this.fastify.log.error(
+          { err: error, requestId: request.id },
+          'Failed to transition COMPLETED â†’ RE_RUN'
+        );
+      }
+    }
+
+    return { transitioned, skipped, maxRetriesReached };
+  }
+
+  // ==================== SUPPLEMENT REQUESTS (RE_RUN) ====================
+
+  /**
+   * Process RE_RUN requests and allocate websites for deficit
+   * Similar to processNewRequests() but calculates deficit from completionTarget
+   */
+  async processSupplementRequests(): Promise<{
+    processed: number;
+    skipped: number;
+    failed: number;
+  }> {
+    return this.supplementRequestsUseCase.execute({
+      getAllocationMultiplier: () => this.getAllocationMultiplier(),
+      getClaimTimeout: () => this.getClaimTimeout(),
+      getCompletionThresholdPercent: () => this.getCompletionThresholdPercent(),
+      getCompletionTarget: (entityLimit, thresholdPercent) =>
+        this.getCompletionTarget(entityLimit, thresholdPercent),
+      allocateForRequestOptimized: (
+        request,
+        multiplier,
+        claimTimeout,
+        overrideEntityLimit
+      ) =>
+        this.allocateForRequestOptimized(
+          request,
+          multiplier,
+          claimTimeout,
+          overrideEntityLimit
+        ),
+    });
   }
 
   // ==================== AUTO-ASSIGN TOOL PAIRS ====================
@@ -2163,35 +2415,10 @@ export class ServiceRequestAllocationService {
     return mapping[serviceType] || ToolService.ENTITY;
   }
 
-  /**
-   * Auto-assign idTool to NEW/PENDING service requests that don't have one.
-   *
-   * Algorithm:
-   * 1. Find all valid tool pairs (both Normal X and Captcha X are RUNNING + INDIVIDUAL)
-   * 2. Find all unassigned requests (idTool IS NULL, status IN (NEW, PENDING), deletedAt IS NULL)
-   * 3. Group requests by priority: HIGH/URGENT first, then LOW/NORMAL
-   * 4. Within each group, sort by auctionPrice DESC, then createdAt ASC
-   * 5. Match tool pairs to requests based on customerType mapping:
-   *    - customerType='priority' → HIGH/URGENT requests
-   *    - customerType='normal'/null → LOW/NORMAL requests
-   * 6. Round-robin distribute across available pairs for load balancing
-   * 7. Update with optimistic lock (WHERE idTool IS NULL)
-   */
-  async autoAssignTools(): Promise<{
-    assigned: number;
-    skipped: number;
-    details: Array<{
-      requestId: string;
-      idTool: string;
-      priority: string;
-      auctionPrice: string | null;
-    }>;
-  }> {
-    // --- Phase 1: Find valid tool pairs ---
-
+  private async buildValidToolPairs(toolType: 'INDIVIDUAL' | 'RE_RUNNING'): Promise<ToolPairInfo[]> {
     const tools = await this.prisma.tool.findMany({
       where: {
-        type: 'INDIVIDUAL',
+        type: toolType,
         status: 'RUNNING',
         deletedAt: null,
       },
@@ -2202,7 +2429,6 @@ export class ServiceRequestAllocationService {
       },
     });
 
-    // Group by pair number: extract number from "Normal X" or "Captcha X"
     const pairMap = new Map<string, {
       normal: { idTool: string; customerType: string | null; service: ToolService } | null;
       captcha: { idTool: string; customerType: string | null; service: ToolService } | null;
@@ -2223,14 +2449,7 @@ export class ServiceRequestAllocationService {
       }
     }
 
-    // Filter to valid pairs (both normal and captcha exist)
-    const validPairs: Array<{
-      pairNumber: string;
-      idToolValue: string;
-      customerType: string;
-      service: ToolService;
-    }> = [];
-
+    const validPairs: ToolPairInfo[] = [];
     for (const [pairNum, pair] of pairMap.entries()) {
       if (pair.normal && pair.captcha) {
         validPairs.push({
@@ -2242,6 +2461,97 @@ export class ServiceRequestAllocationService {
       }
     }
 
+    return validPairs;
+  }
+
+  private async buildLoadMapForPairs(
+    pairs: ToolPairInfo[],
+    statuses: RequestStatus[]
+  ): Promise<Map<string, number>> {
+    const loadMap = new Map<string, number>();
+    for (const pair of pairs) {
+      loadMap.set(pair.idToolValue, 0);
+    }
+
+    if (pairs.length === 0) {
+      return loadMap;
+    }
+
+    const existingCounts = await this.prisma.serviceRequest.groupBy({
+      by: ['idTool'],
+      where: {
+        idTool: { in: pairs.map((p) => p.idToolValue) },
+        status: { in: statuses },
+        deletedAt: null,
+      },
+      _count: { _all: true },
+    });
+
+    for (const row of existingCounts) {
+      if (row.idTool) {
+        loadMap.set(row.idTool, row._count._all);
+      }
+    }
+
+    return loadMap;
+  }
+
+  private async applyAssignments(assignments: AssignmentDetail[]): Promise<{
+    assigned: number;
+    assignedDetails: AssignmentDetail[];
+  }> {
+    let assigned = 0;
+    const assignedDetails: AssignmentDetail[] = [];
+
+    for (const assignment of assignments) {
+      try {
+        await this.prisma.serviceRequest.update({
+          where: {
+            id: assignment.requestId,
+            idTool: null,
+          },
+          data: { idTool: assignment.idTool },
+        });
+        assigned++;
+        assignedDetails.push(assignment);
+      } catch {
+        this.fastify.log.debug(
+          { requestId: assignment.requestId },
+          'Failed to assign tool (likely already assigned)'
+        );
+      }
+    }
+
+    return { assigned, assignedDetails };
+  }
+
+  /**
+   * Auto-assign idTool to NEW/PENDING service requests that don't have one.
+   *
+   * Algorithm:
+   * 1. Find all valid tool pairs (both Normal X and Captcha X are RUNNING + INDIVIDUAL)
+   * 2. Find all unassigned requests (idTool IS NULL, status IN (NEW, PENDING), deletedAt IS NULL)
+   * 3. Group requests by priority: HIGH/URGENT first, then LOW/NORMAL
+   * 4. Within each group, sort by auctionPrice DESC, then createdAt ASC
+   * 5. Match tool pairs to requests based on customerType mapping:
+   *    - customerType='priority' â†’ HIGH/URGENT requests
+   *    - customerType='normal'/null â†’ LOW/NORMAL requests
+   * 6. Round-robin distribute across available pairs for load balancing
+   * 7. Update with optimistic lock (WHERE idTool IS NULL)
+   */
+  async autoAssignTools(): Promise<{
+    assigned: number;
+    skipped: number;
+    details: Array<{
+      requestId: string;
+      idTool: string;
+      priority: string;
+      auctionPrice: string | null;
+    }>;
+  }> {
+    // --- Phase 1: Find valid tool pairs ---
+    const validPairs = await this.buildValidToolPairs('INDIVIDUAL');
+
     if (validPairs.length === 0) {
       return { assigned: 0, skipped: 0, details: [] };
     }
@@ -2252,29 +2562,12 @@ export class ServiceRequestAllocationService {
 
     // --- Phase 2: Find unassigned requests + count existing load per pair ---
 
-    // Count how many active requests (NEW/PENDING/RUNNING) each tool pair already has
-    // This ensures even distribution across tool pairs
-    const allIdToolValues = validPairs.map((p) => p.idToolValue);
-    const existingCounts = await this.prisma.serviceRequest.groupBy({
-      by: ['idTool'],
-      where: {
-        idTool: { in: allIdToolValues },
-        status: { in: [RequestStatus.NEW, RequestStatus.PENDING, RequestStatus.RUNNING] },
-        deletedAt: null,
-      },
-      _count: { _all: true },
-    });
-
-    // Build load map: idToolValue → current active request count
-    const loadMap = new Map<string, number>();
-    for (const pair of validPairs) {
-      loadMap.set(pair.idToolValue, 0);
-    }
-    for (const row of existingCounts) {
-      if (row.idTool) {
-        loadMap.set(row.idTool, row._count._all);
-      }
-    }
+    // Build load map: idToolValue â†’ current active request count
+    const loadMap = await this.buildLoadMapForPairs(validPairs, [
+      RequestStatus.NEW,
+      RequestStatus.PENDING,
+      RequestStatus.RUNNING,
+    ]);
 
     // Note: Not using `select` here because the Prisma client may not have
     // the `priority` field in its generated types yet (requires prisma generate).
@@ -2369,26 +2662,7 @@ export class ServiceRequestAllocationService {
     assignGroup(normalRequests, normalPairs);
 
     // --- Phase 5: Batch update with optimistic lock ---
-
-    let assigned = 0;
-    for (const assignment of assignments) {
-      try {
-        await this.prisma.serviceRequest.update({
-          where: {
-            id: assignment.requestId,
-            idTool: null, // Optimistic lock: only update if still null
-          },
-          data: { idTool: assignment.idTool },
-        });
-        assigned++;
-      } catch {
-        // If update fails (idTool already set by another process), skip
-        this.fastify.log.debug(
-          { requestId: assignment.requestId },
-          'Failed to assign tool (likely already assigned)'
-        );
-      }
-    }
+    const { assigned, assignedDetails } = await this.applyAssignments(assignments);
 
     if (assigned > 0) {
       this.fastify.log.info(
@@ -2397,10 +2671,110 @@ export class ServiceRequestAllocationService {
       );
     }
 
+    // ==================== RE_RUNNING TOOLS â†’ RE_RUN REQUESTS ====================
+    // Separate block: find RE_RUNNING tool pairs and assign to RE_RUN requests
+
+    const reRunResult = await this.autoAssignReRunTools();
+
+    return {
+      assigned: assigned + reRunResult.assigned,
+      skipped: (unassignedRequests.length - assigned) + reRunResult.skipped,
+      details: [
+        ...assignedDetails,
+        ...reRunResult.details,
+      ],
+    };
+  }
+
+  /**
+   * Auto-assign RE_RUNNING tool pairs to RE_RUN requests
+   * Same logic as autoAssignTools() but for supplement requests
+   */
+  private async autoAssignReRunTools(): Promise<{
+    assigned: number;
+    skipped: number;
+    details: Array<{
+      requestId: string;
+      idTool: string;
+      priority: string;
+      auctionPrice: string | null;
+    }>;
+  }> {
+    // Phase 1: Find RE_RUNNING tool pairs
+    const validPairs = await this.buildValidToolPairs('RE_RUNNING');
+
+    if (validPairs.length === 0) {
+      return { assigned: 0, skipped: 0, details: [] };
+    }
+
+    // Phase 2: Count existing load from RE_RUN/RE_RUNNING requests
+    const loadMap = await this.buildLoadMapForPairs(validPairs, [
+      RequestStatus.RE_RUN,
+      RequestStatus.RE_RUNNING,
+    ]);
+
+    // Find unassigned RE_RUN requests
+    const unassignedRequests = await this.prisma.serviceRequest.findMany({
+      where: {
+        idTool: null,
+        status: RequestStatus.RE_RUN,
+        deletedAt: null,
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 200,
+    });
+
+    if (unassignedRequests.length === 0) {
+      return { assigned: 0, skipped: 0, details: [] };
+    }
+
+    // Phase 3: Assign with least-loaded strategy
+    const assignments: AssignmentDetail[] = [];
+
+    type RequestWithPriority = (typeof unassignedRequests)[0] & { priority: string };
+    const requests = unassignedRequests as RequestWithPriority[];
+
+    for (const req of requests) {
+      const toolService = this.mapServiceTypeToToolService(req.serviceType);
+      const matchingPairs = validPairs.filter((p) => p.service === toolService);
+
+      if (matchingPairs.length === 0) continue;
+
+      let bestPair = matchingPairs[0];
+      let bestLoad = loadMap.get(bestPair.idToolValue) ?? 0;
+
+      for (let i = 1; i < matchingPairs.length; i++) {
+        const load = loadMap.get(matchingPairs[i].idToolValue) ?? 0;
+        if (load < bestLoad) {
+          bestLoad = load;
+          bestPair = matchingPairs[i];
+        }
+      }
+
+      loadMap.set(bestPair.idToolValue, bestLoad + 1);
+
+      assignments.push({
+        requestId: req.id,
+        idTool: bestPair.idToolValue,
+        priority: req.priority,
+        auctionPrice: req.auctionPrice ? req.auctionPrice.toString() : null,
+      });
+    }
+
+    // Phase 4: Batch update
+    const { assigned, assignedDetails } = await this.applyAssignments(assignments);
+
+    if (assigned > 0) {
+      this.fastify.log.info(
+        { assigned, total: unassignedRequests.length, pairs: validPairs.length },
+        `Auto-assigned RE_RUNNING idTool to ${assigned} RE_RUN requests`
+      );
+    }
+
     return {
       assigned,
       skipped: unassignedRequests.length - assigned,
-      details: assignments.slice(0, assigned),
+      details: assignedDetails,
     };
   }
 }

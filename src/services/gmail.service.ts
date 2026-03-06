@@ -38,6 +38,86 @@ export class GmailService {
   constructor(private fastify: FastifyInstance) {}
 
   /**
+   * Get gmail info by email address (for public API)
+   * Returns full info including password, 2FA, recovery
+   */
+  async getGmailsByQuery(email?: string, status?: GmailStatus, limit?: number) {
+    const where: Prisma.GmailWhereInput = {};
+    if (email) {
+      where.email = email;
+    }
+    if (status) {
+      where.status = status;
+    }
+
+    const gmails = await this.fastify.prisma.gmail.findMany({
+      where,
+      take: limit || 10,
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        email: true,
+        password: true,
+        appPassword: true,
+        twoFA: true,
+        recoveryEmail: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        deletedAt: true,
+      },
+    });
+
+    return gmails;
+  }
+
+  /**
+   * Atomic claim: SELECT ... FOR UPDATE SKIP LOCKED → UPDATE status to RUNNING
+   * Đảm bảo nhiều tools gọi cùng lúc không bao giờ nhận trùng email
+   */
+  async claimGmails(limit: number = 1) {
+    const claimed = await this.fastify.prisma.$transaction(async (tx) => {
+      // Raw query với FOR UPDATE SKIP LOCKED để lock rows
+      const rows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `SELECT id FROM gmails
+         WHERE status = 'NEW'::"GmailStatus" AND "deletedAt" IS NULL
+         ORDER BY "createdAt" ASC
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED`,
+        limit
+      );
+
+      if (rows.length === 0) return [];
+
+      const ids = rows.map((r) => r.id);
+
+      // Update status sang RUNNING
+      await tx.gmail.updateMany({
+        where: { id: { in: ids } },
+        data: { status: GmailStatus.RUNNING },
+      });
+
+      // Trả về thông tin đầy đủ
+      return tx.gmail.findMany({
+        where: { id: { in: ids } },
+        select: {
+          id: true,
+          email: true,
+          password: true,
+          appPassword: true,
+          twoFA: true,
+          recoveryEmail: true,
+          status: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+    });
+
+    return claimed;
+  }
+
+  /**
    * Check if email exists in the system
    */
   async checkEmailExists(email: string) {
@@ -543,5 +623,77 @@ export class GmailService {
       ...result,
       status: newStatus,
     };
+  }
+
+  /**
+   * Bulk create gmails
+   * - Deduplicates by email (case-insensitive)
+   * - Skips existing emails
+   * - Returns created count, duplicates, invalid
+   */
+  async bulkCreateGmails(
+    input: Array<{
+      email: string;
+      password: string;
+      twoFA?: string;
+      recoveryEmail?: string;
+      status?: GmailStatus;
+    }>
+  ): Promise<{
+    created: number;
+    duplicates: string[];
+    invalid: string[];
+    total: number;
+  }> {
+    const invalid: string[] = [];
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+    // Deduplicate by email (case-insensitive), keep first occurrence
+    const seen = new Set<string>();
+    const uniqueItems: typeof input = [];
+    for (const item of input) {
+      const emailLower = item.email.toLowerCase().trim();
+      if (!emailLower || !emailRegex.test(emailLower)) {
+        invalid.push(item.email);
+        continue;
+      }
+      if (seen.has(emailLower)) continue;
+      seen.add(emailLower);
+      uniqueItems.push({ ...item, email: emailLower });
+    }
+
+    if (uniqueItems.length === 0) {
+      return { created: 0, duplicates: [], invalid, total: input.length };
+    }
+
+    // Check existing emails in DB
+    const existingGmails = await this.fastify.prisma.gmail.findMany({
+      where: { email: { in: uniqueItems.map((i) => i.email) } },
+      select: { email: true },
+    });
+    const existingSet = new Set(existingGmails.map((g) => g.email.toLowerCase()));
+
+    const duplicates = uniqueItems
+      .filter((i) => existingSet.has(i.email))
+      .map((i) => i.email);
+    const newItems = uniqueItems.filter((i) => !existingSet.has(i.email));
+
+    // Bulk insert new emails
+    let created = 0;
+    if (newItems.length > 0) {
+      const result = await this.fastify.prisma.gmail.createMany({
+        data: newItems.map((item) => ({
+          email: item.email,
+          password: item.password,
+          twoFA: item.twoFA || null,
+          recoveryEmail: item.recoveryEmail || null,
+          status: item.status || GmailStatus.NEW,
+        })),
+        skipDuplicates: true,
+      });
+      created = result.count;
+    }
+
+    return { created, duplicates, invalid, total: input.length };
   }
 }

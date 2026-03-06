@@ -729,4 +729,49 @@ export class WebsiteService {
 
     return { matched, unmatched };
   }
+
+  /**
+   * Đối chiếu list domain với toàn bộ hệ thống
+   * Trả về domain trùng (kèm id/status/types) và domain chưa có
+   */
+  async checkDuplicates(domains: string[]): Promise<{
+    total: number;
+    matched: Array<{ id: string; domain: string; status: string; types: string[] }>;
+    unmatchedDomains: string[];
+  }> {
+    const normalizedDomains = [...new Set(
+      domains.map((d) => d.trim().toLowerCase()).filter((d) => d.length > 0)
+    )];
+
+    if (normalizedDomains.length === 0) {
+      return { total: 0, matched: [], unmatchedDomains: [] };
+    }
+
+    const existingWebsites = await this.fastify.prisma.website.findMany({
+      where: {
+        domain: { in: normalizedDomains },
+        deletedAt: null,
+      },
+      select: { id: true, domain: true, status: true, types: true },
+    });
+
+    const existingDomainMap = new Map(
+      existingWebsites.map((w) => [w.domain.toLowerCase(), w])
+    );
+
+    const matched = normalizedDomains
+      .filter((d) => existingDomainMap.has(d))
+      .map((d) => {
+        const w = existingDomainMap.get(d)!;
+        return { id: w.id, domain: w.domain, status: w.status, types: w.types };
+      });
+
+    const unmatchedDomains = normalizedDomains.filter((d) => !existingDomainMap.has(d));
+
+    return {
+      total: normalizedDomains.length,
+      matched,
+      unmatchedDomains,
+    };
+  }
 }

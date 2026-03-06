@@ -2,6 +2,9 @@ import { FastifyInstance } from 'fastify';
 import { Prisma, ServiceType, RequestStatus, RequestPriority, DomainSelection, WebsiteStatus, WebsiteType } from '@prisma/client';
 import { InputJsonValue } from '@prisma/client/runtime/library';
 
+// Max number of times a request can be transitioned to RE_RUN
+const MAX_RE_RUN_COUNT = 2;
+
 export interface CreateServiceRequestInput {
   externalUserId: string;
   externalUserEmail?: string | null;
@@ -403,8 +406,10 @@ export class ServiceRequestService {
       PENDING: ['RUNNING', 'CANCEL'],
       RUNNING: ['CONNECTING', 'COMPLETED', 'CANCEL'],
       CONNECTING: ['COMPLETED', 'CANCEL'],
-      COMPLETED: [], // Terminal state
-      CANCEL: [],    // Terminal state
+      COMPLETED: ['RE_RUN'],                // Cho phép chạy bổ sung
+      CANCEL: [],
+      RE_RUN: ['RE_RUNNING', 'CANCEL'],     // Gán tool → chuyển RE_RUNNING
+      RE_RUNNING: ['COMPLETED', 'CANCEL'],  // Timeout/hoàn thành → COMPLETED
     };
 
     const allowed = validTransitions[existing.status] || [];
@@ -414,9 +419,25 @@ export class ServiceRequestService {
       );
     }
 
+    const isTransitionToReRun =
+      status === RequestStatus.RE_RUN && existing.status !== RequestStatus.RE_RUN;
+
+    if (isTransitionToReRun && existing.runCount >= MAX_RE_RUN_COUNT) {
+      throw this.fastify.httpErrors.badRequest(
+        `Cannot transition to RE_RUN. Maximum runCount (${MAX_RE_RUN_COUNT}) reached.`
+      );
+    }
+
     return this.fastify.prisma.serviceRequest.update({
       where: { id },
-      data: { status },
+      data: {
+        status,
+        ...(isTransitionToReRun && {
+          idTool: null,
+          runCount: { increment: 1 },
+          retryCount: { increment: 1 },
+        }),
+      },
     });
   }
 
@@ -504,6 +525,7 @@ export class ServiceRequestService {
 
   /**
    * Quick update cho admin/dev - không giới hạn status
+   * Khi chuyển sang RE_RUN: tự động reset idTool=null và tăng retryCount
    */
   async quickUpdate(id: string, data: { idTool?: string | null; runCount?: number; target?: string | null; status?: RequestStatus }) {
     const existing = await this.fastify.prisma.serviceRequest.findFirst({
@@ -514,6 +536,14 @@ export class ServiceRequestService {
       throw this.fastify.httpErrors.notFound('ServiceRequest not found');
     }
 
+    const isTransitionToReRun = data.status === RequestStatus.RE_RUN && existing.status !== RequestStatus.RE_RUN;
+
+    if (isTransitionToReRun && existing.runCount >= MAX_RE_RUN_COUNT) {
+      throw this.fastify.httpErrors.badRequest(
+        `Cannot transition to RE_RUN. Maximum runCount (${MAX_RE_RUN_COUNT}) reached.`
+      );
+    }
+
     return this.fastify.prisma.serviceRequest.update({
       where: { id },
       data: {
@@ -521,6 +551,11 @@ export class ServiceRequestService {
         ...(data.runCount !== undefined && { runCount: data.runCount }),
         ...(data.target !== undefined && { target: data.target }),
         ...(data.status !== undefined && { status: data.status }),
+        ...(isTransitionToReRun && {
+          idTool: null,
+          runCount: { increment: 1 },
+          retryCount: { increment: 1 },
+        }),
       },
     });
   }

@@ -31,6 +31,9 @@ const serviceRequestRoutes: FastifyPluginAsync = async (fastify): Promise<void> 
   // PUT /service-requests/:id/status - Cập nhật status
   fastify.put('/:id/status', { preHandler: adminPreHandler }, ServiceRequestController.updateStatus);
 
+  // POST /service-requests/:id/re-run - Set request to RE_RUN for supplement
+  fastify.post('/:id/re-run', { preHandler: adminPreHandler }, ServiceRequestController.reRun);
+
   // DELETE /service-requests/delete/:id - Soft delete
   fastify.delete('/delete/:id', { preHandler: adminPreHandler }, ServiceRequestController.delete);
 };

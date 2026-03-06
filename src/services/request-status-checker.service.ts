@@ -5,14 +5,15 @@ import {
   EntityRequestRepository,
   LinkStatusCount,
 } from '../repositories/mysql-external';
+import { SystemConfigService } from './system-config.service';
 
 /**
  * Service kiểm tra và cập nhật trạng thái request
  *
  * Logic:
  * 1. Request đang "running":
- *    - Nếu số link finish >= 110% entity_limit -> chuyển sang "connecting", cancel các link "new"
- *    - Nếu quá timeout -> chuyển sang "connecting", new -> cancel, finish -> connect
+ *    - Nếu số link finish >= COMPLETION_THRESHOLD_PERCENT% entity_limit -> chuyển sang "connecting", cancel các link "new"
+ *    - Nếu quá timeout -> chuyển sang "connecting", new -> cancel, finish -> connect (giữ nguyên cơ chế timeout)
  *
  * 2. Request đang "connecting":
  *    - Nếu không còn link nào ở trạng thái xử lý (connecting, connect)
@@ -26,9 +27,11 @@ import {
  */
 export class RequestStatusCheckerService {
   private mysqlRepo: MySQLExternalRepositories;
+  private systemConfigService: SystemConfigService;
 
   constructor(private fastify: FastifyInstance) {
     this.mysqlRepo = new MySQLExternalRepositories(fastify.mysql);
+    this.systemConfigService = new SystemConfigService(fastify);
   }
 
   /**
@@ -61,11 +64,14 @@ export class RequestStatusCheckerService {
       const runningIds = runningRequests.map((r) => r.id);
       const linkCountsMap = await this.mysqlRepo.entityLink.countByStatusBatch(runningIds);
 
+      // Get configurable completion threshold
+      const thresholdConfig = await this.systemConfigService.getValue<number>('COMPLETION_THRESHOLD_PERCENT', 110);
+
       for (const request of runningRequests) {
         const linkCounts = linkCountsMap.get(String(request.id));
         if (!linkCounts) continue;
 
-        const transitioned = await this.checkRunningRequestWithCounts(request, linkCounts);
+        const transitioned = await this.checkRunningRequestWithCounts(request, linkCounts, thresholdConfig);
         if (transitioned === 'connecting') {
           result.transitionedToConnecting++;
         } else if (transitioned === 'timeout') {
@@ -128,13 +134,14 @@ export class RequestStatusCheckerService {
    */
   private async checkRunningRequestWithCounts(
     request: EntityRequest,
-    linkCounts: LinkStatusCount
+    linkCounts: LinkStatusCount,
+    thresholdPercent: number
   ): Promise<'connecting' | 'timeout' | null> {
     const requestId = request.id;
     const entityLimit = request.entity_limit;
-    const threshold = Math.ceil(entityLimit * 1.1); // 110%
+    const threshold = Math.ceil(entityLimit * thresholdPercent / 100);
 
-    // Check 1: Số link finish >= 110% entity_limit
+    // Check 1: Số link finish >= COMPLETION_THRESHOLD_PERCENT% entity_limit
     if (linkCounts.finish >= threshold) {
       // Chuyển trạng thái request
       await this.mysqlRepo.entityRequest.updateStatus(requestId, 'connecting');

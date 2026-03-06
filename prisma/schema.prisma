@@ -343,6 +343,8 @@ enum RequestStatus {
   CONNECTING    // Tool đang kết nối/đăng ký
   COMPLETED     // Hoàn thành
   CANCEL        // Đã hủy
+  RE_RUN        // Chờ chạy bổ sung
+  RE_RUNNING    // Đang thực hiện chạy bổ sung
 }
 
 enum RequestPriority {
@@ -613,6 +615,8 @@ model GmailUsage {
 }
 
 enum GmailStatus {
+  NEW         // Mới tạo
+  RUNNING     // Đang xử lý
   SUCCESS     // Thành công
   FAILED      // Thất bại
 }

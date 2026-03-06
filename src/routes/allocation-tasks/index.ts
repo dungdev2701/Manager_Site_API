@@ -51,6 +51,19 @@ const allocationTaskRoutes: FastifyPluginAsync = async (
   );
 
   /**
+   * POST /allocation-tasks/process-supplement
+   * Monitor Service triggers allocation for RE_RUN requests (supplement)
+   */
+  fastify.post(
+    '/process-supplement',
+    {
+      preHandler: monitorApiKeyMiddleware,
+      config: { rateLimit: RATE_LIMITS.normal },
+    },
+    controller.processSupplementRequests.bind(controller)
+  );
+
+  /**
    * POST /allocation-tasks/auto-assign-tools
    * Monitor Service triggers auto-assignment of idTool for unassigned requests
    */

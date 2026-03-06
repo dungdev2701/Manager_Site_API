@@ -42,7 +42,26 @@ export const gmailQuerySchema = paginationSchema.merge(searchSchema).merge(
   })
 );
 
+/**
+ * Bulk create gmail schema
+ */
+export const bulkCreateGmailSchema = z.object({
+  emails: z
+    .array(
+      z.object({
+        email: z.string().min(1),
+        password: z.string().min(1),
+        twoFA: z.string().optional(),
+        recoveryEmail: z.string().optional(),
+        status: z.nativeEnum(GmailStatus).optional(),
+      })
+    )
+    .min(1, 'At least one email is required')
+    .max(1000, 'Maximum 1000 emails allowed'),
+});
+
 // Export types
 export type CreateGmailDTO = z.infer<typeof createGmailSchema>;
 export type UpdateGmailDTO = z.infer<typeof updateGmailSchema>;
 export type GmailQueryDTO = z.infer<typeof gmailQuerySchema>;
+export type BulkCreateGmailDTO = z.infer<typeof bulkCreateGmailSchema>;

@@ -7,11 +7,13 @@ import {
   createBulkWebsitesWithMetricsSchema,
   updateWebsiteSchema,
   websiteQuerySchema,
+  checkDuplicatesSchema,
   CreateWebsiteDTO,
   CreateBulkWebsitesDTO,
   CreateBulkWebsitesWithMetricsDTO,
   UpdateWebsiteDTO,
   WebsiteQueryDTO,
+  CheckDuplicatesDTO,
 } from '../validators/website.validator';
 import { Role, WebsiteStatus } from '@prisma/client';
 
@@ -383,6 +385,24 @@ export class WebsiteController {
     const websites = await websiteService.getWebsitesByIds(ids);
 
     return ResponseHelper.success(reply, { websites, total: websites.length });
+  }
+
+  /**
+   * Đối chiếu list domain với toàn bộ hệ thống
+   * POST /websites/check-duplicates
+   * Permission: ALL can view
+   */
+  static async checkDuplicates(request: FastifyRequest, reply: FastifyReply) {
+    if (!request.user) {
+      return ResponseHelper.unauthorized(reply, 'Authentication required');
+    }
+
+    const validatedData: CheckDuplicatesDTO = checkDuplicatesSchema.parse(request.body);
+
+    const websiteService = new WebsiteService(request.server);
+    const result = await websiteService.checkDuplicates(validatedData.domains);
+
+    return ResponseHelper.success(reply, result);
   }
 
   /**

@@ -16,7 +16,7 @@ const CACHE_TTL_MS = 60 * 1000; // 1 minute cache
 // Valid captcha_type values
 type CaptchaType = 'normal' | 'captcha';
 
-// Rate limit: 10 requests per minute per API key
+// Rate limit: 600 requests per minute per API key
 const PUBLIC_RATE_LIMIT = { max: 600, timeWindow: '1 minute' };
 
 const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
@@ -593,6 +593,34 @@ const publicRoutes: FastifyPluginAsync = async (fastify): Promise<void> => {
     '/allocation-tasks/re-allocate',
     { preHandler: monitorApiKeyMiddleware },
     allocationController.reAllocate.bind(allocationController)
+  );
+
+  /**
+   * POST /api/public/allocation-tasks/process-supplement
+   *
+   * Monitor Service gọi để xử lý RE_RUN requests (chạy bổ sung).
+   * Allocate websites cho deficit và chuyển RE_RUN → RE_RUNNING.
+   *
+   * Xác thực: Monitor API Key
+   */
+  fastify.post(
+    '/allocation-tasks/process-supplement',
+    { preHandler: monitorApiKeyMiddleware },
+    allocationController.processSupplementRequests.bind(allocationController)
+  );
+
+  /**
+   * POST /api/public/allocation-tasks/check-completed-rerun
+   *
+   * Monitor Service gọi để kiểm tra COMPLETED requests chưa đạt target
+   * và tự động chuyển sang RE_RUN (nếu retryCount < 2).
+   *
+   * Xác thực: Monitor API Key
+   */
+  fastify.post(
+    '/allocation-tasks/check-completed-rerun',
+    { preHandler: monitorApiKeyMiddleware },
+    allocationController.checkCompletedForReRun.bind(allocationController)
   );
 
   /**

@@ -37,9 +37,41 @@ export function clearStatisticsCache(prefix?: string): void {
 export class StatisticsService {
   constructor(private fastify: FastifyInstance) {}
 
-  async getOverview() {
-    // Check cache first
-    const cacheKey = 'overview';
+  private createEmptyStatusMap(): Record<string, number> {
+    return {
+      NEW: 0,
+      CHECKING: 0,
+      HANDING: 0,
+      PENDING: 0,
+      RUNNING: 0,
+      ERROR: 0,
+      MAINTENANCE: 0,
+    };
+  }
+
+  async getOverview(params?: { daysAgo?: number; startDate?: Date; endDate?: Date }) {
+    let startDate: Date;
+    let endDate: Date;
+
+    if (params?.startDate && params?.endDate) {
+      startDate = new Date(params.startDate);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(params.endDate);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      const daysAgo = params?.daysAgo ?? 30;
+      endDate = new Date();
+      startDate = new Date();
+      startDate.setDate(startDate.getDate() - daysAgo);
+      startDate.setHours(0, 0, 0, 0);
+    }
+
+    const rangeKey = `${startDate.toISOString().slice(0, 10)}_${endDate.toISOString().slice(0, 10)}`;
+    const isEndDateToday = endDate.toISOString().slice(0, 10) === new Date().toISOString().slice(0, 10);
+
+    // For ranges that include today, skip cache to reduce stale dashboard values.
+    // For historical ranges, keep cached results.
+    const cacheKey = `overview:${rangeKey}`;
     type OverviewResult = {
       totalWebsites: number;
       totalUsers: number;
@@ -55,8 +87,10 @@ export class StatisticsService {
         period: string;
       };
     };
-    const cached = getCached<OverviewResult>(cacheKey);
-    if (cached) return cached;
+    if (!isEndDateToday) {
+      const cached = getCached<OverviewResult>(cacheKey);
+      if (cached) return cached;
+    }
 
     const prisma = this.fastify.prisma;
 
@@ -86,13 +120,12 @@ export class StatisticsService {
       where: { isActive: true },
     });
 
-    // Get allocation stats for last 30 days
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
     const allocationStats = await prisma.dailyAllocation.aggregate({
       where: {
-        date: { gte: thirtyDaysAgo },
+        date: {
+          gte: startDate,
+          lte: endDate,
+        },
       },
       _sum: {
         allocationCount: true,
@@ -109,13 +142,13 @@ export class StatisticsService {
         ? Math.round((totalSuccess / totalAllocations) * 100 * 100) / 100
         : 0;
 
-    // Get websites added this week
-    const oneWeekAgo = new Date();
-    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
     const websitesThisWeek = await prisma.website.count({
       where: {
         deletedAt: null,
-        createdAt: { gte: oneWeekAgo },
+        createdAt: {
+          gte: startDate,
+          lte: endDate,
+        },
       },
     });
 
@@ -126,6 +159,11 @@ export class StatisticsService {
       totalWebsites > 0
         ? Math.round((runningCount / totalWebsites) * 100 * 100) / 100
         : 0;
+
+    const periodDays = Math.max(
+      1,
+      Math.ceil((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000)) + 1
+    );
 
     const result = {
       totalWebsites,
@@ -142,12 +180,13 @@ export class StatisticsService {
         totalSuccess,
         totalFailure,
         overallSuccessRate,
-        period: '30 days',
+        period: `${periodDays} days`,
       },
     };
 
-    // Cache the result
-    setCache(cacheKey, result);
+    if (!isEndDateToday) {
+      setCache(cacheKey, result);
+    }
     return result;
   }
 
@@ -408,32 +447,27 @@ export class StatisticsService {
   async getDailyTrends(startDate: Date, endDate: Date) {
     const prisma = this.fastify.prisma;
 
-    // Get websites created per day
-    const websitesCreated = await prisma.website.groupBy({
-      by: ['createdAt'],
-      where: {
-        deletedAt: null,
-        createdAt: {
-          gte: startDate,
-          lte: endDate,
-        },
-      },
-      _count: { id: true },
-    });
+    // Aggregate directly by day in DB to avoid high-cardinality groupBy(createdAt).
+    const websitesCreated = await prisma.$queryRaw<Array<{ date: Date; count: bigint }>>`
+      SELECT DATE_TRUNC('day', "createdAt") AS date, COUNT(*) AS count
+      FROM websites
+      WHERE "deletedAt" IS NULL
+        AND "createdAt" >= ${startDate}
+        AND "createdAt" <= ${endDate}
+      GROUP BY DATE_TRUNC('day', "createdAt")
+      ORDER BY date ASC
+    `;
 
-    // Get edits per day
-    const editsPerDay = await prisma.auditLog.groupBy({
-      by: ['createdAt'],
-      where: {
-        entity: 'Website',
-        action: 'UPDATE',
-        createdAt: {
-          gte: startDate,
-          lte: endDate,
-        },
-      },
-      _count: { id: true },
-    });
+    const editsPerDay = await prisma.$queryRaw<Array<{ date: Date; count: bigint }>>`
+      SELECT DATE_TRUNC('day', "createdAt") AS date, COUNT(*) AS count
+      FROM audit_logs
+      WHERE entity = 'Website'
+        AND action = 'UPDATE'
+        AND "createdAt" >= ${startDate}
+        AND "createdAt" <= ${endDate}
+      GROUP BY DATE_TRUNC('day', "createdAt")
+      ORDER BY date ASC
+    `;
 
     // Build daily data
     const result: {
@@ -444,14 +478,14 @@ export class StatisticsService {
 
     const websitesByDate = new Map<string, number>();
     for (const w of websitesCreated) {
-      const dateKey = w.createdAt.toISOString().split('T')[0];
-      websitesByDate.set(dateKey, (websitesByDate.get(dateKey) || 0) + w._count.id);
+      const dateKey = new Date(w.date).toISOString().split('T')[0];
+      websitesByDate.set(dateKey, Number(w.count));
     }
 
     const editsByDate = new Map<string, number>();
     for (const e of editsPerDay) {
-      const dateKey = e.createdAt.toISOString().split('T')[0];
-      editsByDate.set(dateKey, (editsByDate.get(dateKey) || 0) + e._count.id);
+      const dateKey = new Date(e.date).toISOString().split('T')[0];
+      editsByDate.set(dateKey, Number(e.count));
     }
 
     const currentDate = new Date(startDate);
@@ -468,30 +502,46 @@ export class StatisticsService {
     return result;
   }
 
-  async getStatusChanges(daysAgo: number) {
+  async getStatusChanges(params: { daysAgo?: number; startDate?: Date; endDate?: Date }) {
     const prisma = this.fastify.prisma;
 
-    // Get current counts by status
-    const currentCounts = await prisma.website.groupBy({
+    // Determine comparison window
+    let startDate: Date;
+    let endDate: Date;
+
+    if (params.startDate && params.endDate) {
+      startDate = new Date(params.startDate);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(params.endDate);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      const daysAgo = params.daysAgo ?? 30;
+      endDate = new Date();
+      startDate = new Date();
+      startDate.setDate(startDate.getDate() - daysAgo);
+      startDate.setHours(0, 0, 0, 0);
+    }
+
+    // Get current (now) counts by status
+    const nowCounts = await prisma.website.groupBy({
       by: ['status'],
       where: { deletedAt: null },
       _count: { status: true },
     });
 
-    // Calculate the date X days ago
-    const pastDate = new Date();
-    pastDate.setDate(pastDate.getDate() - daysAgo);
-    pastDate.setHours(0, 0, 0, 0);
+    const nowStatusMap = this.createEmptyStatusMap();
+    for (const c of nowCounts) {
+      nowStatusMap[c.status] = (c._count as { status: number })?.status ?? 0;
+    }
 
-    // To get past counts, we need to reconstruct the state at that point
-    // We'll use audit logs to track changes and work backwards
+    // Build snapshot at endDate by reversing everything after endDate
+    const currentStatusMap = { ...nowStatusMap };
 
-    // Get all status changes since the past date
-    const statusChanges = await prisma.auditLog.findMany({
+    const statusChangesAfterEnd = await prisma.auditLog.findMany({
       where: {
         entity: 'Website',
         action: 'UPDATE',
-        createdAt: { gte: pastDate },
+        createdAt: { gt: endDate },
       },
       select: {
         entityId: true,
@@ -502,64 +552,27 @@ export class StatisticsService {
       orderBy: { createdAt: 'desc' },
     });
 
-    // Get websites created after pastDate (they didn't exist before)
-    const newWebsites = await prisma.website.findMany({
+    const websitesCreatedAfterEnd = await prisma.website.findMany({
       where: {
         deletedAt: null,
-        createdAt: { gte: pastDate },
+        createdAt: { gt: endDate },
       },
-      select: { id: true, status: true },
+      select: { id: true, status: true, createdAt: true },
     });
 
-    // Get websites deleted after pastDate (they existed before)
-    const deletedWebsites = await prisma.website.findMany({
+    const websitesDeletedAfterEnd = await prisma.website.findMany({
       where: {
-        deletedAt: { gte: pastDate },
+        deletedAt: { gt: endDate },
       },
       select: { id: true, status: true },
     });
 
-    // Build current status map
-    const currentStatusMap: Record<string, number> = {
-      NEW: 0,
-      CHECKING: 0,
-      HANDING: 0,
-      PENDING: 0,
-      RUNNING: 0,
-      ERROR: 0,
-      MAINTENANCE: 0,
-    };
+    const createdAfterEndIds = new Set(websitesCreatedAfterEnd.map(w => w.id));
 
-    for (const c of currentCounts) {
-      currentStatusMap[c.status] = (c._count as { status: number })?.status ?? 0;
-    }
-
-    // Calculate past counts by reversing changes
-    const pastStatusMap = { ...currentStatusMap };
-
-    // Remove websites that were created after pastDate (they didn't exist)
-    const newWebsiteIds = new Set(newWebsites.map(w => w.id));
-    for (const w of newWebsites) {
-      pastStatusMap[w.status]--;
-    }
-
-    // Add back websites that were deleted after pastDate (they existed)
-    for (const w of deletedWebsites) {
-      pastStatusMap[w.status]++;
-    }
-
-    // Track which websites we've already processed the earliest change for
-    const processedWebsites = new Set<string>();
-
-    // Reverse status changes (from newest to oldest)
-    for (const change of statusChanges) {
+    // Reverse status changes after endDate
+    for (const change of statusChangesAfterEnd) {
       if (!change.entityId) continue;
-
-      // Skip if this website was created after pastDate
-      if (newWebsiteIds.has(change.entityId)) continue;
-
-      // Only process each website once (we want the net change)
-      if (processedWebsites.has(change.entityId)) continue;
+      if (createdAfterEndIds.has(change.entityId)) continue;
 
       const oldValues = change.oldValues as Record<string, unknown> | null;
       const newValues = change.newValues as Record<string, unknown> | null;
@@ -570,12 +583,92 @@ export class StatisticsService {
       const newStatus = newValues.status as string | undefined;
 
       if (!oldStatus || !newStatus || oldStatus === newStatus) continue;
+      if (currentStatusMap[newStatus] === undefined || currentStatusMap[oldStatus] === undefined) continue;
 
-      // Reverse the change: current has newStatus, past had oldStatus
+      currentStatusMap[newStatus]--;
+      currentStatusMap[oldStatus]++;
+    }
+
+    // Remove websites created after endDate (didn't exist at endDate)
+    for (const w of websitesCreatedAfterEnd) {
+      if (currentStatusMap[w.status] !== undefined) {
+        currentStatusMap[w.status]--;
+      }
+    }
+
+    // Add back websites deleted after endDate (they existed at endDate)
+    for (const w of websitesDeletedAfterEnd) {
+      if (currentStatusMap[w.status] !== undefined) {
+        currentStatusMap[w.status]++;
+      }
+    }
+
+    // Build past snapshot (startDate) from current snapshot (endDate)
+    const pastStatusMap = { ...currentStatusMap };
+
+    const statusChangesInWindow = await prisma.auditLog.findMany({
+      where: {
+        entity: 'Website',
+        action: 'UPDATE',
+        createdAt: { gt: startDate, lte: endDate },
+      },
+      select: {
+        entityId: true,
+        oldValues: true,
+        newValues: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const websitesCreatedInWindow = await prisma.website.findMany({
+      where: {
+        createdAt: { gt: startDate, lte: endDate },
+      },
+      select: { id: true, status: true },
+    });
+
+    const websitesDeletedInWindow = await prisma.website.findMany({
+      where: {
+        deletedAt: { gt: startDate, lte: endDate },
+      },
+      select: { id: true, status: true },
+    });
+
+    const createdInWindowIds = new Set(websitesCreatedInWindow.map(w => w.id));
+
+    // Reverse all status changes in window
+    for (const change of statusChangesInWindow) {
+      if (!change.entityId) continue;
+      if (createdInWindowIds.has(change.entityId)) continue;
+
+      const oldValues = change.oldValues as Record<string, unknown> | null;
+      const newValues = change.newValues as Record<string, unknown> | null;
+
+      if (!oldValues || !newValues) continue;
+
+      const oldStatus = oldValues.status as string | undefined;
+      const newStatus = newValues.status as string | undefined;
+
+      if (!oldStatus || !newStatus || oldStatus === newStatus) continue;
+      if (pastStatusMap[newStatus] === undefined || pastStatusMap[oldStatus] === undefined) continue;
+
       pastStatusMap[newStatus]--;
       pastStatusMap[oldStatus]++;
+    }
 
-      processedWebsites.add(change.entityId);
+    // Remove websites created within window (didn't exist at startDate)
+    for (const w of websitesCreatedInWindow) {
+      if (pastStatusMap[w.status] !== undefined) {
+        pastStatusMap[w.status]--;
+      }
+    }
+
+    // Add back websites deleted within window (they existed at startDate)
+    for (const w of websitesDeletedInWindow) {
+      if (pastStatusMap[w.status] !== undefined) {
+        pastStatusMap[w.status]++;
+      }
     }
 
     // Calculate differences
@@ -618,16 +711,21 @@ export class StatisticsService {
     };
 
     // Calculate totals
-    const totalCurrent = Object.values(currentStatusMap).reduce((a, b) => a + b, 0);
-    const totalPast = Object.values(pastStatusMap).reduce((a, b) => Math.max(0, a) + Math.max(0, b), 0);
+    const totalCurrent = Object.values(currentStatusMap).reduce((a, b) => a + Math.max(0, b), 0);
+    const totalPast = Object.values(pastStatusMap).reduce((a, b) => a + Math.max(0, b), 0);
+
+    const dayDiff = Math.max(
+      1,
+      Math.ceil((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000))
+    );
 
     return {
-      period: `${daysAgo} days`,
+      period: `${dayDiff} days`,
       changes,
       summary: {
         totalCurrent,
-        totalPast: Math.max(0, totalPast),
-        totalChange: totalCurrent - Math.max(0, totalPast),
+        totalPast,
+        totalChange: totalCurrent - totalPast,
       },
     };
   }

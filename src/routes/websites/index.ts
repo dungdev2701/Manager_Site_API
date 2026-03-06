@@ -34,6 +34,13 @@ const websiteRoutes: FastifyPluginAsync = async (
     WebsiteController.getByIds
   );
 
+  // Check duplicates - compare domain list against system - ALL can view
+  fastify.post(
+    '/check-duplicates',
+    { preHandler: [authMiddleware, canViewWebsites] },
+    WebsiteController.checkDuplicates
+  );
+
   // Filter domains against RUNNING websites - ALL can view
   fastify.post(
     '/filter-domains',
